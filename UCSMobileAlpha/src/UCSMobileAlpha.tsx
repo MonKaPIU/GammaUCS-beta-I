@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -252,6 +251,7 @@ const PREVIEW_LANE_INWARD_OFFSETS = [24, 12, 0, -12, -24] as const;
 const PREVIEW_START_PADDING_MS = 0;
 const PREVIEW_END_PADDING_MS = 0;
 const PREVIEW_BEAT_PULSE_WINDOW_MS = 90;
+const PREVIEW_AUDIO_RESYNC_THRESHOLD_MS = 120;
 const TEMP_LONG_PRESS_MS = 320;
 const TEMP_LONG_MOVE_TOLERANCE = 12;
 const ROW_LONG_PRESS_MS = 340;
@@ -261,6 +261,16 @@ const EDITOR_SCROLL_BOTTOM_PADDING = PREVIEW_VIEWPORT_HEIGHT * (1 - EDITOR_JUDGE
 const ALLOW_REMOTE_PREVIEW_AUDIO = false;
 const MAX_UCS_IMPORT_BYTES = Math.floor(1.5 * 1024 * 1024);
 const MAX_PREVIEW_AUDIO_DURATION_MS = 20 * 60 * 1000;
+const MAX_PREVIEW_AUDIO_BYTES = 300 * 1024 * 1024;
+const ALLOWED_PREVIEW_AUDIO_MIME_TYPES = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/ogg",
+  "audio/webm",
+  "audio/mp4",
+]);
+const ALLOWED_PREVIEW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".ogg", ".m4a", ".webm"] as const;
 
 const parseRows = (rows: string[]): Cell[][] => rows.map((r) => r.split("") as Cell[]);
 
@@ -752,6 +762,16 @@ function formatDurationLabel(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return seconds === 0 ? `${minutes}분` : `${minutes}분 ${seconds}초`;
+}
+
+function isAllowedPreviewAudioFile(file: File): boolean {
+  const normalizedType = file.type.trim().toLowerCase();
+  if (normalizedType && ALLOWED_PREVIEW_AUDIO_MIME_TYPES.has(normalizedType)) {
+    return true;
+  }
+
+  const lowerName = file.name.trim().toLowerCase();
+  return ALLOWED_PREVIEW_AUDIO_EXTENSIONS.some((extension) => lowerName.endsWith(extension));
 }
 
 function serialize(divisions: Division[]): string {
@@ -1410,6 +1430,26 @@ function adjustDivisionSplit(div: Division, newSplit: number): Division {
   };
 }
 
+function getEditorNoteTone(colIdx: number, cell: Exclude<Cell, ".">): string {
+  const isTap = cell === "X";
+
+  if (colIdx === 0 || colIdx === 4) {
+    return isTap
+      ? "border-blue-700 bg-blue-700 text-white"
+      : "border-blue-300 bg-blue-100 text-blue-800";
+  }
+
+  if (colIdx === 1 || colIdx === 3) {
+    return isTap
+      ? "border-orange-500 bg-orange-500 text-white"
+      : "border-orange-300 bg-orange-100 text-orange-800";
+  }
+
+  return isTap
+    ? "border-amber-400 bg-amber-300 text-amber-950"
+    : "border-amber-300 bg-amber-100 text-amber-800";
+}
+
 function TemporaryNoteSprite({ colIdx, kind, size = 56 }: { colIdx: number; kind: TempSpriteKind; size?: number }) {
   const src = getSpritePath(colIdx, kind);
   const renderedHeight = kind === "body" ? Math.max(10, Math.round(size * 0.16)) : size;
@@ -1460,12 +1500,14 @@ export default function UCSMobileAlpha1() {
   const [previewAudioError, setPreviewAudioError] = useState("");
   const [previewAudioDurationMs, setPreviewAudioDurationMs] = useState<number | null>(null);
   const [editorAnchorTimeMs, setEditorAnchorTimeMs] = useState(0);
+  const [appViewportHeight, setAppViewportHeight] = useState<number>(() => (typeof window !== "undefined" ? window.innerHeight : 844));
   const [pendingEditorSyncTarget, setPendingEditorSyncTarget] = useState<EditorSyncTarget | null>(null);
   const previewPlaybackBaseRef = useRef(0);
   const previewPlaybackStartedAtRef = useRef<number | null>(null);
   const previewHitsoundPoolRef = useRef<HTMLAudioElement[]>([]);
   const previewNextHitsoundIndexRef = useRef(0);
   const previewLastHitsoundRowIndexRef = useRef(-1);
+  const previewPlaybackRequestIdRef = useRef(0);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioFileInputRef = useRef<HTMLInputElement | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1620,6 +1662,7 @@ export default function UCSMobileAlpha1() {
   };
 
   const openFileSection = () => {
+    previewPlaybackRequestIdRef.current += 1;
     previewPlaybackBaseRef.current = previewCursorTimeMs;
     previewPlaybackStartedAtRef.current = null;
     setIsPlaying(false);
@@ -1708,7 +1751,18 @@ export default function UCSMobileAlpha1() {
       setToast(message);
     }
   };
-  const previewJudgeLineY = PREVIEW_VIEWPORT_HEIGHT * PREVIEW_JUDGE_LINE_RATIO;
+  useEffect(() => {
+    const updateViewportHeight = () => {
+      setAppViewportHeight(window.innerHeight);
+    };
+    updateViewportHeight();
+    window.addEventListener("resize", updateViewportHeight);
+    return () => window.removeEventListener("resize", updateViewportHeight);
+  }, []);
+
+  const previewViewportHeight = Math.max(320, Math.min(560, appViewportHeight - 250));
+  const editorScrollBottomPadding = previewViewportHeight * (1 - EDITOR_JUDGE_LINE_RATIO) + 48;
+  const previewJudgeLineY = previewViewportHeight * PREVIEW_JUDGE_LINE_RATIO;
   const previewBeatToPx = PREVIEW_NOTE_SIZE * previewZoom;
   const previewMinTimeMs = previewTimingData.chartStartTimeMs - PREVIEW_START_PADDING_MS;
   const previewMaxTimeMs = previewTimingData.chartEndTimeMs + PREVIEW_END_PADDING_MS;
@@ -1901,6 +1955,93 @@ export default function UCSMobileAlpha1() {
     }
   };
 
+  const waitForPreviewAudioEvent = (audio: HTMLAudioElement, eventName: "loadedmetadata" | "canplay" | "playing", timeoutMs = 2500) =>
+    new Promise<void>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        audio.removeEventListener(eventName, handleEvent);
+        reject(new Error(`${eventName} timeout`));
+      }, timeoutMs);
+
+      const handleEvent = () => {
+        window.clearTimeout(timeoutId);
+        audio.removeEventListener(eventName, handleEvent);
+        resolve();
+      };
+
+      audio.addEventListener(eventName, handleEvent);
+    });
+
+  const startPreviewPlaybackSynced = async (startTimeMs: number, successMessage: string) => {
+    const requestId = previewPlaybackRequestIdRef.current + 1;
+    previewPlaybackRequestIdRef.current = requestId;
+
+    const nextTimeMs = Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, startTimeMs));
+    const nextScrollBeat = getPreviewScrollBeatByTime(previewTimingData.divisionSpans, nextTimeMs);
+
+    clearAllPreviewLaneFlash();
+    previewPlaybackBaseRef.current = nextTimeMs;
+    previewPlaybackStartedAtRef.current = null;
+    setPreviewAnchorTimeMs(nextTimeMs);
+    setPreviewCursorTimeMs(nextTimeMs);
+    setPreviewCursorScrollBeat(nextScrollBeat);
+    syncPreviewHitsoundPointer(nextTimeMs);
+    setIsPlaying(false);
+
+    const audio = previewAudioRef.current;
+    if (!audio || !previewAudioSrc) {
+      if (previewPlaybackRequestIdRef.current !== requestId) return;
+      previewPlaybackBaseRef.current = nextTimeMs;
+      previewPlaybackStartedAtRef.current = performance.now();
+      setIsPlaying(true);
+      setToast(successMessage);
+      return;
+    }
+
+    try {
+      audio.pause();
+      if (audio.readyState < 1) {
+        audio.load();
+        await waitForPreviewAudioEvent(audio, "loadedmetadata");
+      }
+      if (previewPlaybackRequestIdRef.current !== requestId) return;
+
+      try {
+        audio.currentTime = Math.max(0, nextTimeMs / 1000);
+      } catch {
+        // noop
+      }
+
+      if (audio.readyState < 3) {
+        await waitForPreviewAudioEvent(audio, "canplay").catch(() => undefined);
+      }
+      if (previewPlaybackRequestIdRef.current !== requestId) return;
+
+      const playingPromise = waitForPreviewAudioEvent(audio, "playing").catch(() => undefined);
+      const playResult = audio.play();
+      if (playResult !== undefined) {
+        await playResult;
+      }
+      await playingPromise;
+      if (previewPlaybackRequestIdRef.current !== requestId) return;
+
+      const actualStartTimeMs = Math.max(0, audio.currentTime * 1000);
+      previewPlaybackBaseRef.current = actualStartTimeMs;
+      previewPlaybackStartedAtRef.current = performance.now();
+      setPreviewAnchorTimeMs(actualStartTimeMs);
+      setPreviewCursorTimeMs(actualStartTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, actualStartTimeMs));
+      syncPreviewHitsoundPointer(actualStartTimeMs);
+      setIsPlaying(true);
+      setToast(successMessage);
+    } catch {
+      if (previewPlaybackRequestIdRef.current !== requestId) return;
+      previewPlaybackBaseRef.current = nextTimeMs;
+      previewPlaybackStartedAtRef.current = performance.now();
+      setIsPlaying(true);
+      setToast("오디오 준비를 기다리지 못해 차트만 먼저 재생합니다.");
+    }
+  };
+
   useEffect(() => {
     const audio = previewAudioRef.current;
     if (!audio) return;
@@ -1987,12 +2128,8 @@ export default function UCSMobileAlpha1() {
     if (currentView !== "preview" || !isPlaying) {
       audio.pause();
       syncPreviewAudioToCursor(previewCursorTimeMs);
-      return;
     }
-
-    syncPreviewAudioToCursor(previewCursorTimeMs);
-    void audio.play().catch(() => undefined);
-  }, [currentView, isPlaying, previewAudioSrc]);
+  }, [currentView, isPlaying, previewAudioSrc, previewCursorTimeMs]);
 
   const loadPreviewAudioFromUrl = () => {
     setToast(
@@ -2003,6 +2140,7 @@ export default function UCSMobileAlpha1() {
   };
 
   const clearPreviewAudio = () => {
+    previewPlaybackRequestIdRef.current += 1;
     const audio = previewAudioRef.current;
     if (audio) {
       audio.pause();
@@ -2026,6 +2164,22 @@ export default function UCSMobileAlpha1() {
   const handlePreviewAudioFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+
+    if (file.size > MAX_PREVIEW_AUDIO_BYTES) {
+      setPreviewAudioStatus("error");
+      setPreviewAudioError(`오디오 파일 크기는 최대 ${formatImportSize(MAX_PREVIEW_AUDIO_BYTES)}까지만 허용됩니다. 현재 ${formatImportSize(file.size)}입니다.`);
+      setToast(`오디오 업로드 실패: 최대 ${formatImportSize(MAX_PREVIEW_AUDIO_BYTES)}까지 업로드할 수 있습니다.`);
+      event.target.value = "";
+      return;
+    }
+
+    if (!isAllowedPreviewAudioFile(file)) {
+      setPreviewAudioStatus("error");
+      setPreviewAudioError("지원하지 않는 오디오 형식입니다. mp3, wav, ogg, m4a, webm 파일만 업로드할 수 있습니다.");
+      setToast("오디오 업로드 실패: 지원하지 않는 형식입니다.");
+      event.target.value = "";
+      return;
+    }
 
     if (previewObjectUrlRef.current) {
       URL.revokeObjectURL(previewObjectUrlRef.current);
@@ -2068,6 +2222,7 @@ export default function UCSMobileAlpha1() {
       setSelectedDivisionIdx(firstIssue.divIdx);
       setSelectedRow({ divIdx: firstIssue.divIdx, rowIdx: firstIssue.rowIdx });
       setCurrentView("editor");
+      previewPlaybackRequestIdRef.current += 1;
       setIsPlaying(false);
       setToast(`프리뷰를 열 수 없습니다. ${actualRowLabel(divisions, firstIssue.divIdx, firstIssue.rowIdx)} ${CELL_LABELS[firstIssue.colIdx]}열: ${firstIssue.message}`);
       return;
@@ -2083,8 +2238,15 @@ export default function UCSMobileAlpha1() {
     previewPlaybackBaseRef.current = startTime;
     previewPlaybackStartedAtRef.current = null;
     setCurrentView("preview");
-    setIsPlaying(autoplay);
-    setToast(autoplay ? "플레이어 재생을 시작했습니다." : "플레이어 화면을 열었습니다.");
+
+    if (autoplay) {
+      void startPreviewPlaybackSynced(startTime, "플레이어 재생을 시작했습니다.");
+      return;
+    }
+
+    previewPlaybackRequestIdRef.current += 1;
+    setIsPlaying(false);
+    setToast("플레이어 화면을 열었습니다.");
   };
 
   const openEditorScreen = () => {
@@ -2094,6 +2256,7 @@ export default function UCSMobileAlpha1() {
     const syncTimeMs = previewCursorTimeMs;
     const nearestRow = resolveEditorSyncRowByTime(previewTimingData, syncTimeMs);
 
+    previewPlaybackRequestIdRef.current += 1;
     previewPlaybackBaseRef.current = syncTimeMs;
     previewPlaybackStartedAtRef.current = null;
     setIsPlaying(false);
@@ -2119,9 +2282,11 @@ export default function UCSMobileAlpha1() {
     }
 
     if (isPlaying) {
+      previewPlaybackRequestIdRef.current += 1;
       previewPlaybackBaseRef.current = previewCursorTimeMs;
       previewPlaybackStartedAtRef.current = null;
       setIsPlaying(false);
+      previewAudioRef.current?.pause();
       setToast("플레이어를 일시정지했습니다.");
       return;
     }
@@ -2130,23 +2295,15 @@ export default function UCSMobileAlpha1() {
       previewCursorTimeMs >= previewTimingData.chartEndTimeMs + PREVIEW_END_PADDING_MS
         ? previewAnchorTimeMs
         : previewCursorTimeMs;
-    const restartScrollBeat = getPreviewScrollBeatByTime(previewTimingData.divisionSpans, restartTime);
-    setPreviewCursorTimeMs(restartTime);
-    setPreviewCursorScrollBeat(restartScrollBeat);
-    syncPreviewHitsoundPointer(restartTime);
-    syncPreviewAudioToCursor(restartTime);
-    previewPlaybackBaseRef.current = restartTime;
-    previewPlaybackStartedAtRef.current = null;
-    setPreviewAnchorTimeMs(restartTime);
-    setIsPlaying(true);
-    setToast("플레이어 재생을 시작했습니다.");
+
+    void startPreviewPlaybackSynced(restartTime, "플레이어 재생을 시작했습니다.");
   };
 
   useEffect(() => {
     if (currentView !== "preview" || !isPlaying) return;
 
     const baseTimeMs = previewPlaybackBaseRef.current;
-    const startedAt = performance.now();
+    const startedAt = previewPlaybackStartedAtRef.current ?? performance.now();
     previewPlaybackStartedAtRef.current = startedAt;
     let rafId = 0;
 
@@ -2173,8 +2330,10 @@ export default function UCSMobileAlpha1() {
         playHitsoundsUntil(cappedEndTime);
         setPreviewCursorTimeMs(cappedEndTime);
         setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, cappedEndTime));
+        previewPlaybackRequestIdRef.current += 1;
         previewPlaybackBaseRef.current = cappedEndTime;
         previewPlaybackStartedAtRef.current = null;
+        previewAudioRef.current?.pause();
         setIsPlaying(false);
         setToast("차트 끝에 도달해 재생을 멈췄습니다.");
         return;
@@ -2182,7 +2341,7 @@ export default function UCSMobileAlpha1() {
 
       playHitsoundsUntil(nextTimeMs);
       const previewAudio = previewAudioRef.current;
-      if (previewAudio && previewAudioSrc && Math.abs(previewAudio.currentTime - nextTimeMs / 1000) > 0.12) {
+      if (previewAudio && previewAudioSrc && Math.abs(previewAudio.currentTime - nextTimeMs / 1000) > PREVIEW_AUDIO_RESYNC_THRESHOLD_MS / 1000) {
         try {
           previewAudio.currentTime = Math.max(0, nextTimeMs / 1000);
         } catch {
@@ -2202,7 +2361,7 @@ export default function UCSMobileAlpha1() {
     const grouped = Array.from({ length: CELL_LABELS.length }, () => [] as Array<PreviewTapEvent & { y: number }>);
     previewTimingData.tapEvents.forEach((event) => {
       const y = previewJudgeLineY + (event.scrollBeatValue - previewCursorScrollBeat) * previewBeatToPx;
-      if (y >= -PREVIEW_NOTE_SIZE && y <= PREVIEW_VIEWPORT_HEIGHT + PREVIEW_NOTE_SIZE) {
+      if (y >= -PREVIEW_NOTE_SIZE && y <= previewViewportHeight + PREVIEW_NOTE_SIZE) {
         grouped[event.colIdx].push({ ...event, y });
       }
     });
@@ -2219,7 +2378,7 @@ export default function UCSMobileAlpha1() {
       const endY = previewJudgeLineY + (event.endScrollBeat - previewCursorScrollBeat) * previewBeatToPx;
       const bodyTop = Math.min(startY, endY);
       const bodyHeight = Math.max(2, Math.abs(endY - startY));
-      if (bodyTop <= PREVIEW_VIEWPORT_HEIGHT + PREVIEW_NOTE_SIZE && bodyTop + bodyHeight >= -PREVIEW_NOTE_SIZE) {
+      if (bodyTop <= previewViewportHeight + PREVIEW_NOTE_SIZE && bodyTop + bodyHeight >= -PREVIEW_NOTE_SIZE) {
         grouped[event.colIdx].push({ ...event, startY, endY, bodyTop, bodyHeight });
       }
     });
@@ -3299,10 +3458,10 @@ export default function UCSMobileAlpha1() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-900">
-      <div className="mx-auto flex min-h-screen w-full max-w-md flex-col">
-        <div className="sticky top-0 z-40 border-b bg-white/95 backdrop-blur">
-          <div className="px-3 pb-3 pt-3">
+    <div className="h-[100dvh] overflow-hidden overscroll-none bg-slate-100 text-slate-900">
+      <div className="mx-auto flex h-full w-full max-w-md flex-col overflow-hidden">
+        <div className="z-40 shrink-0 border-b bg-white/95 backdrop-blur">
+          <div className="px-3 pb-0 pt-3">
             <div className="flex items-start justify-between gap-3">
               <div className="flex min-w-0 items-start gap-2">
                 <Button variant="ghost" size="icon" className="h-9 w-9 shrink-0 rounded-full" onClick={() => setLeftPanelOpen(true)}>
@@ -3369,13 +3528,14 @@ export default function UCSMobileAlpha1() {
           </div>
         </div>
 
-        <main className="flex-1 space-y-3 px-3 pb-36 pt-3">
+        <main className="flex-1 min-h-0 overflow-hidden">
           {appSection === "file" ? (
-            <Card className="overflow-hidden rounded-[28px] border-slate-300 shadow-sm">
-              <CardHeader className="border-b bg-slate-50">
-                <CardTitle className="text-base">UCS 파일</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4 p-4">
+            <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white">
+              <div className="border-b bg-slate-50 px-4 py-3">
+                <div className="text-base font-semibold">UCS 파일</div>
+                <div className="mt-1 text-xs text-slate-500">새 UCS, 가져오기, 복사, 다운로드를 관리합니다.</div>
+              </div>
+              <div className="flex min-h-0 flex-1 flex-col space-y-4 p-4">
                 <input ref={importFileInputRef} type="file" accept=".ucs,.txt,text/plain" className="hidden" onChange={handleImportFileChange} />
                 <div className="grid gap-1">
                   <div className="text-xs font-medium text-slate-600">익스포트 파일명</div>
@@ -3392,12 +3552,11 @@ export default function UCSMobileAlpha1() {
                   <Button variant="outline" className="rounded-2xl" onClick={downloadUcsFile}><Save className="mr-2 h-4 w-4" />.ucs 다운로드</Button>
                   <Button variant="outline" className="rounded-2xl" onClick={openWorkspaceSection}><ChevronLeft className="mr-2 h-4 w-4" />작업 화면</Button>
                 </div>
-                <textarea readOnly value={serializedUcs} className="h-[52vh] min-h-[320px] w-full rounded-2xl border bg-slate-50 p-4 font-mono text-xs leading-5 text-slate-700" />
-              </CardContent>
-            </Card>
+                <textarea readOnly value={serializedUcs} className="min-h-0 flex-1 rounded-2xl border bg-slate-50 p-4 font-mono text-xs leading-5 text-slate-700" />
+              </div>
+            </div>
           ) : currentView === "editor" ? (
-              <Card className="overflow-hidden rounded-[28px] border-slate-300 shadow-sm">
-                <CardContent className="p-0">
+              <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white">
                   <div className="border-b bg-slate-50 px-3 py-2.5">
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0 text-xs text-slate-600">Div {selectedDivisionIdx + 1} · BPM {selectedDivision.bpm} · Split {selectedDivision.split}</div>
@@ -3429,7 +3588,7 @@ export default function UCSMobileAlpha1() {
                     </div>
                   </div>
 
-                  <div className="relative h-[58vh] min-h-[420px] bg-white">
+                  <div className="relative flex-1 min-h-0 bg-white">
                     <div ref={editorScrollRef} className="h-full overflow-y-auto px-2 py-3">
                       <div style={{ height: EDITOR_SCROLL_TOP_PADDING }} />
                       <div className="space-y-1">
@@ -3533,7 +3692,7 @@ export default function UCSMobileAlpha1() {
                                       onPointerUp={handleCellPointerEnd}
                                       onPointerLeave={handleCellPointerEnd}
                                       onPointerCancel={handleCellPointerEnd}
-                                      className={`relative aspect-square rounded-xl border text-sm font-semibold transition ${isAnchorCell ? "border-sky-500 bg-sky-100 text-sky-900 ring-2 ring-sky-300" : isRangeCell ? "border-sky-400 bg-sky-50 text-sky-900" : isPending ? "border-slate-900 bg-slate-900 text-white" : cell === "." ? item.isExpandedHidden ? "border-slate-200 bg-slate-50 text-slate-300" : "border-slate-200 bg-white text-slate-300" : cell === "X" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-700 bg-slate-200 text-slate-900"}`}
+                                      className={`relative aspect-square rounded-xl border text-sm font-semibold transition ${isAnchorCell ? "border-sky-500 bg-sky-100 text-sky-900 ring-2 ring-sky-300" : isRangeCell ? "border-sky-400 bg-sky-50 text-sky-900" : isPending ? "border-slate-900 bg-slate-900 text-white" : cell === "." ? item.isExpandedHidden ? "border-slate-200 bg-slate-50 text-slate-300" : "border-slate-200 bg-white text-slate-300" : getEditorNoteTone(colIdx, cell)}`}
                                     >
                                       <span>{cell === "." ? "·" : cell}</span>
                                       {showMarker && <span className="pointer-events-none absolute bottom-1 right-1 text-[9px] font-medium text-slate-500">{markerText}</span>}
@@ -3544,18 +3703,16 @@ export default function UCSMobileAlpha1() {
                             </div>
                           );
                         })}
-                        <div style={{ height: EDITOR_SCROLL_BOTTOM_PADDING }} />
+                        <div style={{ height: editorScrollBottomPadding }} />
                       </div>
                     </div>
                     <div className="pointer-events-none absolute left-2 right-2 z-20 border-t-2 border-sky-400 shadow-[0_0_14px_rgba(56,189,248,0.78)]" style={{ top: `${EDITOR_JUDGE_LINE_RATIO * 100}%` }} />
                   </div>
-                </CardContent>
-              </Card>
+            </div>
           ) : (
-            <Card className="overflow-hidden rounded-[28px] border-slate-300 shadow-sm">
-              <CardContent className="p-0">
-                <div className="bg-slate-950 px-4 py-4">
-                  <div className="relative">
+            <div className="flex h-full min-h-0 flex-col overflow-hidden bg-slate-950">
+                <div className="flex min-h-0 flex-1 flex-col bg-slate-950 px-4 py-4">
+                  <div className="relative flex min-h-0 flex-1 flex-col">
                     <button
                       type="button"
                       onClick={() => setPreviewInfoPanelOpen((prev) => !prev)}
@@ -3642,8 +3799,8 @@ export default function UCSMobileAlpha1() {
                     )}
 
                     <div
-                      className="relative overflow-hidden rounded-[28px] border border-slate-700 bg-[radial-gradient(circle_at_top,_rgba(51,65,85,0.45),_rgba(2,6,23,0.98))]"
-                      style={{ height: PREVIEW_VIEWPORT_HEIGHT, touchAction: "none" }}
+                      className="relative flex-1 min-h-0 overflow-hidden rounded-[28px] border border-slate-700 bg-[radial-gradient(circle_at_top,_rgba(51,65,85,0.45),_rgba(2,6,23,0.98))]"
+                      style={{ height: previewViewportHeight, touchAction: "none" }}
                       onWheel={handlePreviewWheel}
                       onPointerDown={handlePreviewPointerDown}
                       onPointerMove={handlePreviewPointerMove}
@@ -3742,8 +3899,7 @@ export default function UCSMobileAlpha1() {
                     </div>
                   </div>
                 </div>
-              </CardContent>
-            </Card>
+            </div>
           )}
         </main>
         {appSection === "workspace" && currentView === "editor" && toolSheetOpen && (
@@ -3826,22 +3982,22 @@ export default function UCSMobileAlpha1() {
       )}
 
       {appSection === "workspace" && (
-        <div className="fixed inset-x-0 bottom-0 z-40 border-t bg-white/95 backdrop-blur">
-          <div className="mx-auto w-full max-w-md px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3">
+        <div className="z-40 shrink-0 border-t bg-white/95 backdrop-blur">
+          <div className="mx-auto w-full max-w-md px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2">
             {currentView === "editor" ? (
               <>
                 <div className="grid grid-cols-4 gap-2">
-                  <Button onClick={() => { setMode("note"); setSelectTool("row_single"); clearAllSelection(); }} className={`rounded-2xl ${mode === "note" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>X</Button>
-                  <Button onClick={() => { setMode("long"); if (pendingLongStart && isTemporaryLongStart) { setIsTemporaryLongStart(false); clearSelectOnlyState(); setSelectedDivisionIdx(pendingLongStart.divIdx); setSelectedRow({ divIdx: pendingLongStart.divIdx, rowIdx: pendingLongStart.rowIdx }); setToast("임시 롱모드를 정식 롱노트 모드로 전환했습니다."); return; } clearAllSelection(); }} className={`rounded-2xl ${mode === "long" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>롱노트</Button>
-                  <Button onClick={() => { setMode("select"); setPendingLongStart(null); setIsTemporaryLongStart(false); setRangeAnchor(null); setSelectedCellRange(null); }} className={`rounded-2xl ${mode === "select" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>선택</Button>
-                  <Button variant={toolSheetOpen ? "default" : "outline"} onClick={() => setToolSheetOpen((prev) => !prev)} className="rounded-2xl">
+                  <Button onClick={() => { setMode("note"); setSelectTool("row_single"); clearAllSelection(); }} className={`h-11 rounded-2xl text-sm ${mode === "note" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>X</Button>
+                  <Button onClick={() => { setMode("long"); if (pendingLongStart && isTemporaryLongStart) { setIsTemporaryLongStart(false); clearSelectOnlyState(); setSelectedDivisionIdx(pendingLongStart.divIdx); setSelectedRow({ divIdx: pendingLongStart.divIdx, rowIdx: pendingLongStart.rowIdx }); setToast("임시 롱모드를 정식 롱노트 모드로 전환했습니다."); return; } clearAllSelection(); }} className={`h-11 rounded-2xl text-sm ${mode === "long" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>롱노트</Button>
+                  <Button onClick={() => { setMode("select"); setPendingLongStart(null); setIsTemporaryLongStart(false); setRangeAnchor(null); setSelectedCellRange(null); }} className={`h-11 rounded-2xl text-sm ${mode === "select" ? "" : "bg-slate-200 text-slate-900 hover:bg-slate-300"}`}>선택</Button>
+                  <Button variant={toolSheetOpen ? "default" : "outline"} onClick={() => setToolSheetOpen((prev) => !prev)} className="h-11 rounded-2xl text-sm">
                     <SlidersHorizontal className="mr-1 h-4 w-4" />도구
                   </Button>
                 </div>
                 {mode === "select" && (
                   <div className="mt-2 grid grid-cols-2 gap-2">
-                    <Button variant={selectTool === "row_single" ? "default" : "outline"} className="rounded-2xl" onClick={() => { setSelectTool("row_single"); clearSelectOnlyState(); setToast("행 단일 선택 모드로 전환했습니다."); }}>행 단일</Button>
-                    <Button variant={selectTool === "range" ? "default" : "outline"} className="rounded-2xl" onClick={() => { setSelectTool("range"); clearSelectOnlyState(); setToast("범위 선택 모드로 전환했습니다."); }}>범위 선택</Button>
+                    <Button variant={selectTool === "row_single" ? "default" : "outline"} className="h-10 rounded-2xl text-sm" onClick={() => { setSelectTool("row_single"); clearSelectOnlyState(); setToast("행 단일 선택 모드로 전환했습니다."); }}>행 단일</Button>
+                    <Button variant={selectTool === "range" ? "default" : "outline"} className="h-10 rounded-2xl text-sm" onClick={() => { setSelectTool("range"); clearSelectOnlyState(); setToast("범위 선택 모드로 전환했습니다."); }}>범위 선택</Button>
                   </div>
                 )}
                 <div className="mt-2 rounded-2xl bg-slate-100 px-3 py-2 text-xs text-slate-600">{selectedCellRangeSize ? `셀 범위 ${selectedCellRangeSize}` : currentPointerText}</div>
@@ -3849,8 +4005,8 @@ export default function UCSMobileAlpha1() {
             ) : (
               <>
                 <div className="grid grid-cols-2 gap-2">
-                  <Button className="rounded-2xl" onClick={togglePreviewPlayback}>{isPlaying ? <Pause className="mr-2 h-4 w-4" /> : <Play className="mr-2 h-4 w-4" />}{isPlaying ? "Pause" : "Play"}</Button>
-                  <Button variant="outline" className="rounded-2xl" onClick={openEditorScreen}><ChevronLeft className="mr-2 h-4 w-4" />Editor로</Button>
+                  <Button className="h-11 rounded-2xl text-sm" onClick={togglePreviewPlayback}>{isPlaying ? <Pause className="mr-2 h-4 w-4" /> : <Play className="mr-2 h-4 w-4" />}{isPlaying ? "Pause" : "Play"}</Button>
+                  <Button variant="outline" className="h-11 rounded-2xl text-sm" onClick={openEditorScreen}><ChevronLeft className="mr-2 h-4 w-4" />Editor로</Button>
                 </div>
                 <div className="mt-2 rounded-2xl bg-slate-100 px-3 py-2 text-xs text-slate-600">{previewCurrentRowText} · {formatPreviewTimeMs(previewCursorTimeMs)} ms</div>
               </>
@@ -4074,8 +4230,11 @@ export default function UCSMobileAlpha1() {
                 <Button variant="outline" className="rounded-2xl" onClick={() => { closeRowDivisionSheet(); splitHere(); }}>
                   <Scissors className="mr-2 h-4 w-4" />Split Here
                 </Button>
-                <Button variant="outline" className="col-span-2 rounded-2xl" onClick={() => { closeRowDivisionSheet(); mergeDivisionWithBelow(); }}>
+                <Button variant="outline" className="rounded-2xl" onClick={() => { closeRowDivisionSheet(); mergeDivisionWithBelow(); }}>
                   <Rows3 className="mr-2 h-4 w-4" />Merge
+                </Button>
+                <Button variant="outline" className="rounded-2xl text-red-600" onClick={() => { closeRowDivisionSheet(); deleteSelectedRows(); }}>
+                  <Trash2 className="mr-2 h-4 w-4" />행 삭제
                 </Button>
               </div>
               <div className="mt-4">
