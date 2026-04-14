@@ -1021,7 +1021,9 @@ function runUcsParserSelfChecks() {
   }
 }
 
-runUcsParserSelfChecks();
+if (import.meta.env.DEV) {
+  runUcsParserSelfChecks();
+}
 
 function findNearestActualRowByTime(rowEvents: PreviewRowEvent[], timeMs: number): RowSelection | null {
   if (rowEvents.length === 0) return null;
