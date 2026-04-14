@@ -25,13 +25,13 @@ import {
   Rows3,
   Undo2,
 } from "lucide-react";
+import { getReceptorPath, getSpritePath, PREVIEW_HITSOUND_URL, type TempSpriteKind } from "@/config/assets";
 
 type Cell = "." | "X" | "M" | "H" | "W";
 type ClipboardCell = Cell | "*";
 type Mode = "note" | "long" | "select";
 type ZoomLevel = 1 | 2 | 4 | 8;
 type DelayUnit = "ms" | "beat";
-type TempSpriteKind = "tap" | "head" | "body" | "tail";
 type ViewMode = "editor" | "preview";
 type AppSection = "workspace" | "file";
 type SelectTool = "row_single" | "range";
@@ -258,41 +258,9 @@ const ROW_LONG_PRESS_MS = 340;
 const ROW_LONG_MOVE_TOLERANCE = 10;
 const EDITOR_SCROLL_TOP_PADDING = 84;
 const EDITOR_SCROLL_BOTTOM_PADDING = PREVIEW_VIEWPORT_HEIGHT * (1 - EDITOR_JUDGE_LINE_RATIO) + 48;
-
-const REAL_SPRITE_BASE_URL = "https://cdn.jsdelivr.net/gh/MonKaPIU/piupnxnotes@master/PNXnoteskins";
-const PREVIEW_HITSOUND_URL = "https://cdn.jsdelivr.net/gh/MonKaPIU/piupnxnotes@master/PIUticks/chuckmodilowcut.wav";
-const PREVIEW_RECEPTOR_BASE_URL = "https://cdn.jsdelivr.net/gh/MonKaPIU/UCSMobileEssets@master/receptor";
-
-const REAL_SPRITE_ASSETS = {
-  tap: {
-    1: `${REAL_SPRITE_BASE_URL}/1X.png`,
-    2: `${REAL_SPRITE_BASE_URL}/2X.png`,
-    3: `${REAL_SPRITE_BASE_URL}/3X.png`,
-    4: `${REAL_SPRITE_BASE_URL}/4X.png`,
-    5: `${REAL_SPRITE_BASE_URL}/5X.png`,
-  },
-  head: {
-    1: `${REAL_SPRITE_BASE_URL}/1M.png`,
-    2: `${REAL_SPRITE_BASE_URL}/2M.png`,
-    3: `${REAL_SPRITE_BASE_URL}/3M.png`,
-    4: `${REAL_SPRITE_BASE_URL}/4M.png`,
-    5: `${REAL_SPRITE_BASE_URL}/5M.png`,
-  },
-  body: {
-    1: `${REAL_SPRITE_BASE_URL}/1H.png`,
-    2: `${REAL_SPRITE_BASE_URL}/2H.png`,
-    3: `${REAL_SPRITE_BASE_URL}/3H.png`,
-    4: `${REAL_SPRITE_BASE_URL}/4H.png`,
-    5: `${REAL_SPRITE_BASE_URL}/5H.png`,
-  },
-  tail: {
-    1: `${REAL_SPRITE_BASE_URL}/1W.png`,
-    2: `${REAL_SPRITE_BASE_URL}/2W.png`,
-    3: `${REAL_SPRITE_BASE_URL}/3W.png`,
-    4: `${REAL_SPRITE_BASE_URL}/4W.png`,
-    5: `${REAL_SPRITE_BASE_URL}/5W.png`,
-  },
-} as const;
+const ALLOW_REMOTE_PREVIEW_AUDIO = false;
+const MAX_UCS_IMPORT_BYTES = Math.floor(1.5 * 1024 * 1024);
+const MAX_PREVIEW_AUDIO_DURATION_MS = 20 * 60 * 1000;
 
 const parseRows = (rows: string[]): Cell[][] => rows.map((r) => r.split("") as Cell[]);
 
@@ -371,14 +339,6 @@ function convertDelayValue(value: number, fromUnit: DelayUnit, toUnit: DelayUnit
   return fromUnit === "ms" ? value / msPerBeat : value * msPerBeat;
 }
 
-function getSpritePath(colIdx: number, kind: TempSpriteKind): string {
-  const laneNumber = (colIdx + 1) as 1 | 2 | 3 | 4 | 5;
-  return REAL_SPRITE_ASSETS[kind][laneNumber];
-}
-
-function getReceptorPath(colIdx: number): string {
-  return `${PREVIEW_RECEPTOR_BASE_URL}/${colIdx + 1}XR.png`;
-}
 
 function buildHiddenMarkers(rows: Cell[][], hiddenRows: number[]): HiddenMarker[] {
   return CELL_LABELS.map((_, colIdx) => ({
@@ -778,6 +738,22 @@ function buildUcsFileName(raw: string): string {
   return `${base}.ucs`;
 }
 
+function getTextByteLength(value: string): number {
+  return new Blob([value]).size;
+}
+
+function formatImportSize(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${mb.toFixed(2)} MB`;
+}
+
+function formatDurationLabel(ms: number): string {
+  const totalSeconds = Math.ceil(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes}분` : `${minutes}분 ${seconds}초`;
+}
+
 function serialize(divisions: Division[]): string {
   const header = [":Format=1", ":Mode=Single"];
   const body = divisions.flatMap((div) => [
@@ -841,6 +817,10 @@ function formatUcsImportErrorMessage(error: unknown, sourceLabel: string): strin
 }
 
 function parseUcsText(text: string): Division[] {
+  const textBytes = getTextByteLength(text);
+  if (textBytes > MAX_UCS_IMPORT_BYTES) {
+    throw createUcsImportError(`UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(textBytes)}입니다.`);
+  }
   const CR = String.fromCharCode(13);
   const LF = String.fromCharCode(10);
   const CRLF = CR + LF;
@@ -1473,10 +1453,9 @@ export default function UCSMobileAlpha1() {
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewHitsoundVolume, setPreviewHitsoundVolume] = useState(0.7);
   const [previewZoomDraft, setPreviewZoomDraft] = useState("1.0");
-  const [previewAudioUrlInput, setPreviewAudioUrlInput] = useState("");
   const [previewAudioSrc, setPreviewAudioSrc] = useState("");
   const [previewAudioLabel, setPreviewAudioLabel] = useState("오디오 없음");
-  const [previewAudioMode, setPreviewAudioMode] = useState<"none" | "url" | "file">("none");
+  const [previewAudioMode, setPreviewAudioMode] = useState<"none" | "file">("none");
   const [previewAudioStatus, setPreviewAudioStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [previewAudioError, setPreviewAudioError] = useState("");
   const [previewAudioDurationMs, setPreviewAudioDurationMs] = useState<number | null>(null);
@@ -1695,6 +1674,12 @@ export default function UCSMobileAlpha1() {
       return;
     }
 
+    const sourceBytes = getTextByteLength(source);
+    if (sourceBytes > MAX_UCS_IMPORT_BYTES) {
+      setToast(`텍스트 가져오기 실패${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(sourceBytes)}입니다.`);
+      return;
+    }
+
     try {
       const importedDivisions = parseUcsText(source);
       applyImportedDivisions(importedDivisions, "텍스트");
@@ -1708,6 +1693,11 @@ export default function UCSMobileAlpha1() {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
+
+    if (file.size > MAX_UCS_IMPORT_BYTES) {
+      setToast(`파일 가져오기 실패 · ${file.name}${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(file.size)}입니다.`);
+      return;
+    }
 
     try {
       const source = await file.text();
@@ -1916,9 +1906,27 @@ export default function UCSMobileAlpha1() {
     if (!audio) return;
 
     const handleLoadedMetadata = () => {
-      if (Number.isFinite(audio.duration)) {
-        setPreviewAudioDurationMs(audio.duration * 1000);
+      if (!Number.isFinite(audio.duration)) return;
+      const durationMs = audio.duration * 1000;
+      if (durationMs > MAX_PREVIEW_AUDIO_DURATION_MS) {
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+        if (previewObjectUrlRef.current) {
+          URL.revokeObjectURL(previewObjectUrlRef.current);
+          previewObjectUrlRef.current = null;
+        }
+        setPreviewAudioSrc("");
+        setPreviewAudioLabel("오디오 없음");
+        setPreviewAudioMode("none");
+        setPreviewAudioStatus("error");
+        setPreviewAudioError(`오디오 길이는 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지만 허용됩니다. 현재 ${formatDurationLabel(durationMs)}입니다.`);
+        setPreviewAudioDurationMs(null);
+        if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
+        setToast(`오디오 길이 제한을 초과했습니다. 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지 업로드할 수 있습니다.`);
+        return;
       }
+      setPreviewAudioDurationMs(durationMs);
     };
 
     const handleCanPlay = () => {
@@ -1987,25 +1995,11 @@ export default function UCSMobileAlpha1() {
   }, [currentView, isPlaying, previewAudioSrc]);
 
   const loadPreviewAudioFromUrl = () => {
-    const nextUrl = previewAudioUrlInput.trim();
-    if (!nextUrl) {
-      setToast("오디오 URL을 입력하세요.");
-      return;
-    }
-
-    if (previewObjectUrlRef.current) {
-      URL.revokeObjectURL(previewObjectUrlRef.current);
-      previewObjectUrlRef.current = null;
-    }
-
-    const fileName = nextUrl.split("/").pop() || "remote-audio";
-    setPreviewAudioSrc(nextUrl);
-    setPreviewAudioLabel(fileName);
-    setPreviewAudioMode("url");
-    setPreviewAudioStatus("loading");
-    setPreviewAudioError("");
-    setPreviewAudioDurationMs(null);
-    setToast(`오디오 URL을 불러왔습니다: ${fileName}`);
+    setToast(
+      ALLOW_REMOTE_PREVIEW_AUDIO
+        ? "원격 오디오 정책을 확인하세요."
+        : "보안 설정으로 원격 오디오 URL 입력은 비활성화되어 있습니다.",
+    );
   };
 
   const clearPreviewAudio = () => {
@@ -2025,7 +2019,6 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioStatus("idle");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
-    setPreviewAudioUrlInput("");
     if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
     setToast("프리뷰 오디오를 제거했습니다.");
   };
@@ -2047,7 +2040,6 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioStatus("loading");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
-    setPreviewAudioUrlInput("");
     setToast(`오디오 파일을 불러왔습니다: ${file.name}`);
     event.target.value = "";
   };
@@ -3628,17 +3620,6 @@ export default function UCSMobileAlpha1() {
                         <div className="rounded-2xl bg-white/5 p-3">
                           <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">Preview Audio</div>
                           <div className="mt-2 flex items-center gap-2">
-                            <Input
-                              value={previewAudioUrlInput}
-                              onChange={(event) => setPreviewAudioUrlInput(event.target.value)}
-                              placeholder="https://.../audio.mp3"
-                              className="h-8 rounded-xl border-white/15 bg-white/10 text-white placeholder:text-slate-400"
-                            />
-                            <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={loadPreviewAudioFromUrl}>
-                              Load
-                            </Button>
-                          </div>
-                          <div className="mt-2 flex items-center gap-2">
                             <input ref={previewAudioFileInputRef} type="file" accept="audio/*" className="hidden" onChange={handlePreviewAudioFileChange} />
                             <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => previewAudioFileInputRef.current?.click()}>
                               Upload
@@ -3647,6 +3628,7 @@ export default function UCSMobileAlpha1() {
                               Clear
                             </Button>
                           </div>
+                          <div className="mt-2 rounded-xl bg-slate-900/40 px-3 py-2 text-[11px] text-slate-400">원격 URL 입력은 배포 보안 설정에 따라 숨겨져 있습니다.</div>
                           <div className="mt-2 text-[11px] text-slate-400">{previewAudioLabel}</div>
                           <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
                             <span>{previewAudioMode === "none" ? "OFF" : previewAudioMode.toUpperCase()}</span>
