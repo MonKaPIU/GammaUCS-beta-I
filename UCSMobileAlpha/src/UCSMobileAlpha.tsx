@@ -1021,7 +1021,9 @@ function runUcsParserSelfChecks() {
   }
 }
 
-if (import.meta.env.DEV) {
+const isDevRuntime = ((import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV ?? false) === true;
+
+if (isDevRuntime) {
   runUcsParserSelfChecks();
 }
 
@@ -1506,10 +1508,13 @@ export default function UCSMobileAlpha1() {
   const [pendingEditorSyncTarget, setPendingEditorSyncTarget] = useState<EditorSyncTarget | null>(null);
   const previewPlaybackBaseRef = useRef(0);
   const previewPlaybackStartedAtRef = useRef<number | null>(null);
-  const previewHitsoundPoolRef = useRef<HTMLAudioElement[]>([]);
-  const previewNextHitsoundIndexRef = useRef(0);
+  const previewHitsoundAudioContextRef = useRef<AudioContext | null>(null);
+  const previewHitsoundBufferRef = useRef<AudioBuffer | null>(null);
+  const previewHitsoundLoadPromiseRef = useRef<Promise<AudioBuffer | null> | null>(null);
+  const previewHitsoundGainRef = useRef<GainNode | null>(null);
   const previewLastHitsoundRowIndexRef = useRef(-1);
   const previewPlaybackRequestIdRef = useRef(0);
+  const previewPlaybackUsesAudioClockRef = useRef(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioFileInputRef = useRef<HTMLInputElement | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1665,6 +1670,7 @@ export default function UCSMobileAlpha1() {
 
   const openFileSection = () => {
     previewPlaybackRequestIdRef.current += 1;
+    previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = previewCursorTimeMs;
     previewPlaybackStartedAtRef.current = null;
     setIsPlaying(false);
@@ -1791,10 +1797,11 @@ export default function UCSMobileAlpha1() {
     setPreviewCursorTimeMs(nextTimeMs);
     setPreviewCursorScrollBeat(nextScrollBeat);
     setPreviewAnchorTimeMs(nextTimeMs);
+    previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = nextTimeMs;
     previewPlaybackStartedAtRef.current = null;
     syncPreviewHitsoundPointer(nextTimeMs);
-    syncPreviewAudioToCursor(nextTimeMs);
+    writePreviewAudioTime(nextTimeMs)
     return nextTimeMs;
   };
 
@@ -1804,10 +1811,11 @@ export default function UCSMobileAlpha1() {
     setPreviewCursorScrollBeat(nextScrollBeat);
     setPreviewCursorTimeMs(nextTimeMs);
     setPreviewAnchorTimeMs(nextTimeMs);
+    previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = nextTimeMs;
     previewPlaybackStartedAtRef.current = null;
     syncPreviewHitsoundPointer(nextTimeMs);
-    syncPreviewAudioToCursor(nextTimeMs);
+    writePreviewAudioTime(nextTimeMs);
     return nextScrollBeat;
   };
 
@@ -1843,15 +1851,85 @@ export default function UCSMobileAlpha1() {
     event.currentTarget.releasePointerCapture(event.pointerId);
   };
 
+  const getPreviewHitsoundAudioContext = () => {
+    if (previewHitsoundAudioContextRef.current) return previewHitsoundAudioContextRef.current;
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return null;
+
+    const context = new AudioContextCtor();
+    const gainNode = context.createGain();
+    gainNode.gain.value = normalizeHitsoundVolume(previewHitsoundVolume);
+    gainNode.connect(context.destination);
+
+    previewHitsoundAudioContextRef.current = context;
+    previewHitsoundGainRef.current = gainNode;
+    return context;
+  };
+
+  const ensurePreviewHitsoundBuffer = async () => {
+    if (previewHitsoundBufferRef.current) return previewHitsoundBufferRef.current;
+    if (previewHitsoundLoadPromiseRef.current) return previewHitsoundLoadPromiseRef.current;
+
+    const context = getPreviewHitsoundAudioContext();
+    if (!context) return null;
+
+    const loadPromise = fetch(PREVIEW_HITSOUND_URL)
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`hitsound fetch failed: ${response.status}`);
+        }
+        const arrayBuffer = await response.arrayBuffer();
+        return context.decodeAudioData(arrayBuffer.slice(0));
+      })
+      .then((buffer) => {
+        previewHitsoundBufferRef.current = buffer;
+        return buffer;
+      })
+      .catch(() => null)
+      .finally(() => {
+        previewHitsoundLoadPromiseRef.current = null;
+      });
+
+    previewHitsoundLoadPromiseRef.current = loadPromise;
+    return loadPromise;
+  };
+
+  const resumePreviewHitsoundContext = async () => {
+    const context = getPreviewHitsoundAudioContext();
+    if (!context) return null;
+    if (context.state === "suspended") {
+      try {
+        await context.resume();
+      } catch {
+        // noop
+      }
+    }
+    void ensurePreviewHitsoundBuffer();
+    return context;
+  };
+
   const playPreviewHitsound = () => {
-    if (previewHitsoundPoolRef.current.length === 0) return;
-    const index = previewNextHitsoundIndexRef.current % previewHitsoundPoolRef.current.length;
-    const audio = previewHitsoundPoolRef.current[index];
-    previewNextHitsoundIndexRef.current = (index + 1) % previewHitsoundPoolRef.current.length;
+    const context = previewHitsoundAudioContextRef.current;
+    const buffer = previewHitsoundBufferRef.current;
+    const gainNode = previewHitsoundGainRef.current;
+
+    if (!context || !buffer || !gainNode) {
+      void resumePreviewHitsoundContext();
+      return;
+    }
+
+    if (context.state === "suspended") {
+      void context.resume();
+      return;
+    }
+
     try {
-      audio.volume = normalizeHitsoundVolume(previewHitsoundVolume);
-      audio.currentTime = 0;
-      void audio.play().catch(() => undefined);
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gainNode);
+      source.start();
     } catch {
       // noop
     }
@@ -1902,20 +1980,17 @@ export default function UCSMobileAlpha1() {
   };
 
   useEffect(() => {
-    const poolSize = 8;
-    previewHitsoundPoolRef.current = Array.from({ length: poolSize }, () => {
-      const audio = new Audio(PREVIEW_HITSOUND_URL);
-      audio.preload = "auto";
-      audio.volume = normalizeHitsoundVolume(previewHitsoundVolume);
-      return audio;
-    });
-    previewNextHitsoundIndexRef.current = 0;
+    void ensurePreviewHitsoundBuffer();
     return () => {
-      previewHitsoundPoolRef.current.forEach((audio) => {
-        audio.pause();
-        audio.src = "";
-      });
-      previewHitsoundPoolRef.current = [];
+      previewHitsoundLoadPromiseRef.current = null;
+      previewHitsoundBufferRef.current = null;
+      previewHitsoundGainRef.current?.disconnect();
+      previewHitsoundGainRef.current = null;
+      const context = previewHitsoundAudioContextRef.current;
+      previewHitsoundAudioContextRef.current = null;
+      if (context) {
+        void context.close().catch(() => undefined);
+      }
       previewLaneFlashTimeoutsRef.current.forEach((timeoutId, colIdx) => {
         if (timeoutId !== null) {
           window.clearTimeout(timeoutId);
@@ -1926,10 +2001,9 @@ export default function UCSMobileAlpha1() {
   }, []);
 
   useEffect(() => {
-    const nextVolume = normalizeHitsoundVolume(previewHitsoundVolume);
-    previewHitsoundPoolRef.current.forEach((audio) => {
-      audio.volume = nextVolume;
-    });
+    if (previewHitsoundGainRef.current) {
+      previewHitsoundGainRef.current.gain.value = normalizeHitsoundVolume(previewHitsoundVolume);
+    }
   }, [previewHitsoundVolume]);
 
   useEffect(() => {
@@ -1947,7 +2021,7 @@ export default function UCSMobileAlpha1() {
     };
   }, []);
 
-  const syncPreviewAudioToCursor = (timeMs: number) => {
+  const writePreviewAudioTime = (timeMs: number) => {
     const audio = previewAudioRef.current;
     if (!audio || !previewAudioSrc) return;
     try {
@@ -1955,6 +2029,12 @@ export default function UCSMobileAlpha1() {
     } catch {
       // noop
     }
+  };
+
+  const readPreviewAudioClockTime = () => {
+    const audio = previewAudioRef.current;
+    if (!previewPlaybackUsesAudioClockRef.current || !audio || !previewAudioSrc) return null;
+    return Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, audio.currentTime * 1000));
   };
 
   const waitForPreviewAudioEvent = (audio: HTMLAudioElement, eventName: "loadedmetadata" | "canplay" | "playing", timeoutMs = 2500) =>
@@ -1974,8 +2054,10 @@ export default function UCSMobileAlpha1() {
     });
 
   const startPreviewPlaybackSynced = async (startTimeMs: number, successMessage: string) => {
+    void resumePreviewHitsoundContext();
     const requestId = previewPlaybackRequestIdRef.current + 1;
     previewPlaybackRequestIdRef.current = requestId;
+    previewPlaybackUsesAudioClockRef.current = false;
 
     const nextTimeMs = Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, startTimeMs));
     const nextScrollBeat = getPreviewScrollBeatByTime(previewTimingData.divisionSpans, nextTimeMs);
@@ -1992,6 +2074,7 @@ export default function UCSMobileAlpha1() {
     const audio = previewAudioRef.current;
     if (!audio || !previewAudioSrc) {
       if (previewPlaybackRequestIdRef.current !== requestId) return;
+      previewPlaybackUsesAudioClockRef.current = false;
       previewPlaybackBaseRef.current = nextTimeMs;
       previewPlaybackStartedAtRef.current = performance.now();
       setIsPlaying(true);
@@ -2027,8 +2110,9 @@ export default function UCSMobileAlpha1() {
       if (previewPlaybackRequestIdRef.current !== requestId) return;
 
       const actualStartTimeMs = Math.max(0, audio.currentTime * 1000);
+      previewPlaybackUsesAudioClockRef.current = true;
       previewPlaybackBaseRef.current = actualStartTimeMs;
-      previewPlaybackStartedAtRef.current = performance.now();
+      previewPlaybackStartedAtRef.current = null;
       setPreviewAnchorTimeMs(actualStartTimeMs);
       setPreviewCursorTimeMs(actualStartTimeMs);
       setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, actualStartTimeMs));
@@ -2037,6 +2121,7 @@ export default function UCSMobileAlpha1() {
       setToast(successMessage);
     } catch {
       if (previewPlaybackRequestIdRef.current !== requestId) return;
+      previewPlaybackUsesAudioClockRef.current = false;
       previewPlaybackBaseRef.current = nextTimeMs;
       previewPlaybackStartedAtRef.current = performance.now();
       setIsPlaying(true);
@@ -2108,7 +2193,7 @@ export default function UCSMobileAlpha1() {
       setPreviewAudioDurationMs(null);
       audio.src = previewAudioSrc;
       audio.load();
-      syncPreviewAudioToCursor(previewCursorTimeMs);
+      writePreviewAudioTime(previewCursorTimeMs)
     }
 
     return () => {
@@ -2129,7 +2214,7 @@ export default function UCSMobileAlpha1() {
 
     if (currentView !== "preview" || !isPlaying) {
       audio.pause();
-      syncPreviewAudioToCursor(previewCursorTimeMs);
+      writePreviewAudioTime(previewCursorTimeMs)
     }
   }, [currentView, isPlaying, previewAudioSrc, previewCursorTimeMs]);
 
@@ -2143,6 +2228,7 @@ export default function UCSMobileAlpha1() {
 
   const clearPreviewAudio = () => {
     previewPlaybackRequestIdRef.current += 1;
+    previewPlaybackUsesAudioClockRef.current = false;
     const audio = previewAudioRef.current;
     if (audio) {
       audio.pause();
@@ -2236,7 +2322,8 @@ export default function UCSMobileAlpha1() {
     setPreviewCursorTimeMs(startTime);
     setPreviewCursorScrollBeat(startScrollBeat);
     syncPreviewHitsoundPointer(startTime);
-    syncPreviewAudioToCursor(startTime);
+    writePreviewAudioTime(startTime)
+    previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = startTime;
     previewPlaybackStartedAtRef.current = null;
     setCurrentView("preview");
@@ -2259,6 +2346,7 @@ export default function UCSMobileAlpha1() {
     const nearestRow = resolveEditorSyncRowByTime(previewTimingData, syncTimeMs);
 
     previewPlaybackRequestIdRef.current += 1;
+    previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = syncTimeMs;
     previewPlaybackStartedAtRef.current = null;
     setIsPlaying(false);
@@ -2285,6 +2373,7 @@ export default function UCSMobileAlpha1() {
 
     if (isPlaying) {
       previewPlaybackRequestIdRef.current += 1;
+      previewPlaybackUsesAudioClockRef.current = false;
       previewPlaybackBaseRef.current = previewCursorTimeMs;
       previewPlaybackStartedAtRef.current = null;
       setIsPlaying(false);
@@ -2309,47 +2398,66 @@ export default function UCSMobileAlpha1() {
     previewPlaybackStartedAtRef.current = startedAt;
     let rafId = 0;
 
+    const playHitsoundsUntil = (targetTimeMs: number) => {
+      for (let index = previewLastHitsoundRowIndexRef.current + 1; index < previewTimingData.rowEvents.length; index += 1) {
+        const row = previewTimingData.rowEvents[index];
+        if (!row.hasHitsound) continue;
+        if (row.startTimeMs <= targetTimeMs + 0.001) {
+          playPreviewHitsound();
+          triggerPreviewLaneFeedback(row.laneCells);
+          previewLastHitsoundRowIndexRef.current = index;
+          continue;
+        }
+        break;
+      }
+    };
+
+    const stopPlaybackAt = (targetTimeMs: number, message: string, pauseAudio: boolean) => {
+      playHitsoundsUntil(targetTimeMs);
+      setPreviewCursorTimeMs(targetTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, targetTimeMs));
+      previewPlaybackRequestIdRef.current += 1;
+      previewPlaybackUsesAudioClockRef.current = false;
+      previewPlaybackBaseRef.current = targetTimeMs;
+      previewPlaybackStartedAtRef.current = null;
+      if (pauseAudio) previewAudioRef.current?.pause();
+      setIsPlaying(false);
+      setToast(message);
+    };
+
     const tick = (now: number) => {
-      const elapsedMs = now - startedAt;
-      const nextTimeMs = baseTimeMs + elapsedMs;
+      const previewAudio = previewAudioRef.current;
+      const audioClockTimeMs = readPreviewAudioClockTime();
+      const usingAudioClock = audioClockTimeMs !== null;
       const cappedEndTime = previewTimingData.chartEndTimeMs + PREVIEW_END_PADDING_MS;
 
-      const playHitsoundsUntil = (targetTimeMs: number) => {
-        for (let index = previewLastHitsoundRowIndexRef.current + 1; index < previewTimingData.rowEvents.length; index += 1) {
-          const row = previewTimingData.rowEvents[index];
-          if (!row.hasHitsound) continue;
-          if (row.startTimeMs <= targetTimeMs + 0.001) {
-            playPreviewHitsound();
-            triggerPreviewLaneFeedback(row.laneCells);
-            previewLastHitsoundRowIndexRef.current = index;
-            continue;
-          }
-          break;
+      if (usingAudioClock && previewAudio) {
+        if (previewAudio.ended) {
+          stopPlaybackAt(Math.min(cappedEndTime, Math.max(previewMinTimeMs, previewAudio.currentTime * 1000)), "오디오 재생이 끝나 프리뷰를 멈췄습니다.", false);
+          return;
         }
-      };
 
+        const nextTimeMs = Math.max(previewMinTimeMs, Math.min(cappedEndTime, audioClockTimeMs ?? 0));
+        if (nextTimeMs >= cappedEndTime) {
+          stopPlaybackAt(cappedEndTime, "차트 끝에 도달해 재생을 멈췄습니다.", true);
+          return;
+        }
+
+        playHitsoundsUntil(nextTimeMs);
+        setPreviewCursorTimeMs(nextTimeMs);
+        setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, nextTimeMs));
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+
+      const elapsedMs = now - startedAt;
+      const nextTimeMs = baseTimeMs + elapsedMs;
       if (nextTimeMs >= cappedEndTime) {
-        playHitsoundsUntil(cappedEndTime);
-        setPreviewCursorTimeMs(cappedEndTime);
-        setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, cappedEndTime));
-        previewPlaybackRequestIdRef.current += 1;
-        previewPlaybackBaseRef.current = cappedEndTime;
-        previewPlaybackStartedAtRef.current = null;
-        previewAudioRef.current?.pause();
-        setIsPlaying(false);
-        setToast("차트 끝에 도달해 재생을 멈췄습니다.");
+        stopPlaybackAt(cappedEndTime, "차트 끝에 도달해 재생을 멈췄습니다.", true);
         return;
       }
 
       playHitsoundsUntil(nextTimeMs);
-      const previewAudio = previewAudioRef.current;
-      if (previewAudio && previewAudioSrc && Math.abs(previewAudio.currentTime - nextTimeMs / 1000) > PREVIEW_AUDIO_RESYNC_THRESHOLD_MS / 1000) {
-        try {
-          previewAudio.currentTime = Math.max(0, nextTimeMs / 1000);
-        } catch {
-          // noop
-        }
-      }
       setPreviewCursorTimeMs(nextTimeMs);
       setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, nextTimeMs));
       rafId = requestAnimationFrame(tick);
@@ -2357,7 +2465,7 @@ export default function UCSMobileAlpha1() {
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [currentView, isPlaying, previewTimingData.chartEndTimeMs, previewTimingData.divisionSpans]);
+  }, [currentView, isPlaying, previewAudioSrc, previewMinTimeMs, previewTimingData.chartEndTimeMs, previewTimingData.divisionSpans, previewTimingData.rowEvents]);
 
   const previewTapEventsByLane = useMemo(() => {
     const grouped = Array.from({ length: CELL_LABELS.length }, () => [] as Array<PreviewTapEvent & { y: number }>);
