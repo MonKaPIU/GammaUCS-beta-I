@@ -1795,6 +1795,11 @@ export default function UCSMobileAlpha1() {
   const previewProgressPercent = Math.round(previewProgressRatio * 100);
   const previewProgressCurrentMs = Math.max(0, previewCursorTimeMs - previewMinTimeMs);
   const previewProgressDurationMs = Math.max(0, previewMaxTimeMs - previewMinTimeMs);
+  const previewTotalCombo = useMemo(() => previewTimingData.rowEvents.filter((row) => row.hasNote).length, [previewTimingData.rowEvents]);
+  const previewCurrentCombo = useMemo(
+    () => previewTimingData.rowEvents.filter((row) => row.hasNote && row.startTimeMs <= previewCursorTimeMs + 0.001).length,
+    [previewCursorTimeMs, previewTimingData.rowEvents],
+  );
   const previewCurrentRowRef = useMemo(() => resolveEditorSyncRowByTime(previewTimingData, previewCursorTimeMs), [previewTimingData, previewCursorTimeMs]);
   const previewCurrentRowText = previewCurrentRowRef
     ? `Div ${previewCurrentRowRef.divIdx + 1} · Row ${previewCurrentRowRef.rowIdx + 1}`
@@ -3932,9 +3937,9 @@ export default function UCSMobileAlpha1() {
                       <div className="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(255,255,255,0.05),rgba(255,255,255,0.015),rgba(0,0,0,0.26))]" />
                       <div className="absolute inset-x-0 top-0 z-30 px-4 py-2">
                         <div className="rounded-2xl bg-slate-950/65 px-3 py-2 backdrop-blur-sm">
-                          <div className="flex items-center justify-between gap-3 text-[11px] text-slate-200">
-                            <span className="font-semibold">{previewProgressPercent}%</span>
-                            <span>{formatPreviewTimeMs(previewProgressCurrentMs)} / {formatPreviewTimeMs(previewProgressDurationMs)} ms</span>
+                          <div className="flex items-end justify-between gap-3 text-slate-200">
+                            <span className="text-[18px] font-bold leading-none tracking-[0.01em]">Combo {previewCurrentCombo} / {previewTotalCombo}</span>
+                            <span className="text-[11px] text-slate-300">{formatPreviewTimeMs(previewProgressCurrentMs)} / {formatPreviewTimeMs(previewProgressDurationMs)} ms</span>
                           </div>
                           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/15">
                             <div className="h-full rounded-full bg-cyan-300/90 transition-[width] duration-100" style={{ width: `${previewProgressPercent}%` }} />
