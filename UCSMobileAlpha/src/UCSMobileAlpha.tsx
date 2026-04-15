@@ -245,13 +245,12 @@ const ROW_LABEL_WIDTH = "w-20";
 const PREVIEW_VIEWPORT_HEIGHT = 560;
 const PREVIEW_JUDGE_LINE_RATIO = 0.18;
 const EDITOR_JUDGE_LINE_RATIO = 0.09;
-const PREVIEW_NOTE_SIZE = 62;
-const PREVIEW_BODY_WIDTH = PREVIEW_NOTE_SIZE;
-const PREVIEW_LANE_INWARD_OFFSETS = [24, 12, 0, -12, -24] as const;
+const PREVIEW_BASE_NOTE_SIZE = 62;
+const PREVIEW_MIN_NOTE_SIZE = 48;
+const PREVIEW_BASE_LANE_INWARD_OFFSETS = [24, 12, 0, -12, -24] as const;
 const PREVIEW_START_PADDING_MS = 0;
 const PREVIEW_END_PADDING_MS = 0;
 const PREVIEW_BEAT_PULSE_WINDOW_MS = 90;
-const PREVIEW_AUDIO_RESYNC_THRESHOLD_MS = 120;
 const TEMP_LONG_PRESS_MS = 320;
 const TEMP_LONG_MOVE_TOLERANCE = 12;
 const ROW_LONG_PRESS_MS = 340;
@@ -1505,6 +1504,7 @@ export default function UCSMobileAlpha1() {
   const [previewAudioDurationMs, setPreviewAudioDurationMs] = useState<number | null>(null);
   const [editorAnchorTimeMs, setEditorAnchorTimeMs] = useState(0);
   const [appViewportHeight, setAppViewportHeight] = useState<number>(() => (typeof window !== "undefined" ? window.innerHeight : 844));
+  const [appViewportWidth, setAppViewportWidth] = useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 390));
   const [pendingEditorSyncTarget, setPendingEditorSyncTarget] = useState<EditorSyncTarget | null>(null);
   const previewPlaybackBaseRef = useRef(0);
   const previewPlaybackStartedAtRef = useRef<number | null>(null);
@@ -1760,18 +1760,30 @@ export default function UCSMobileAlpha1() {
     }
   };
   useEffect(() => {
-    const updateViewportHeight = () => {
+    const updateViewportSize = () => {
       setAppViewportHeight(window.innerHeight);
+      setAppViewportWidth(window.innerWidth);
     };
-    updateViewportHeight();
-    window.addEventListener("resize", updateViewportHeight);
-    return () => window.removeEventListener("resize", updateViewportHeight);
+    updateViewportSize();
+    window.addEventListener("resize", updateViewportSize);
+    return () => window.removeEventListener("resize", updateViewportSize);
   }, []);
 
   const previewViewportHeight = Math.max(320, Math.min(560, appViewportHeight - 250));
+  const previewAppWidth = Math.min(appViewportWidth, 448);
+  const previewCardInnerWidth = Math.max(280, previewAppWidth - 32);
+  const previewLaneContentWidth = Math.max(220, previewCardInnerWidth - 40);
+  const previewLaneWidth = previewLaneContentWidth / CELL_LABELS.length;
+  const previewNoteSize = Math.min(
+    PREVIEW_BASE_NOTE_SIZE,
+    Math.max(PREVIEW_MIN_NOTE_SIZE, roundToDecimals(previewLaneWidth * 0.82, 1)),
+  );
+  const previewBodyWidth = previewNoteSize;
+  const previewLaneScale = previewNoteSize / PREVIEW_BASE_NOTE_SIZE;
+  const previewLaneInwardOffsets = PREVIEW_BASE_LANE_INWARD_OFFSETS.map((offset) => roundToDecimals(offset * previewLaneScale, 1));
   const editorScrollBottomPadding = previewViewportHeight * (1 - EDITOR_JUDGE_LINE_RATIO) + 48;
   const previewJudgeLineY = previewViewportHeight * PREVIEW_JUDGE_LINE_RATIO;
-  const previewBeatToPx = PREVIEW_NOTE_SIZE * previewZoom;
+  const previewBeatToPx = previewNoteSize * previewZoom;
   const previewMinTimeMs = previewTimingData.chartStartTimeMs - PREVIEW_START_PADDING_MS;
   const previewMaxTimeMs = previewTimingData.chartEndTimeMs + PREVIEW_END_PADDING_MS;
   const previewMinScrollBeat = previewTimingData.chartStartScrollBeat;
@@ -2471,7 +2483,7 @@ export default function UCSMobileAlpha1() {
     const grouped = Array.from({ length: CELL_LABELS.length }, () => [] as Array<PreviewTapEvent & { y: number }>);
     previewTimingData.tapEvents.forEach((event) => {
       const y = previewJudgeLineY + (event.scrollBeatValue - previewCursorScrollBeat) * previewBeatToPx;
-      if (y >= -PREVIEW_NOTE_SIZE && y <= previewViewportHeight + PREVIEW_NOTE_SIZE) {
+      if (y >= -previewNoteSize && y <= previewViewportHeight + previewNoteSize) {
         grouped[event.colIdx].push({ ...event, y });
       }
     });
@@ -2488,7 +2500,7 @@ export default function UCSMobileAlpha1() {
       const endY = previewJudgeLineY + (event.endScrollBeat - previewCursorScrollBeat) * previewBeatToPx;
       const bodyTop = Math.min(startY, endY);
       const bodyHeight = Math.max(2, Math.abs(endY - startY));
-      if (bodyTop <= previewViewportHeight + PREVIEW_NOTE_SIZE && bodyTop + bodyHeight >= -PREVIEW_NOTE_SIZE) {
+      if (bodyTop <= previewViewportHeight + previewNoteSize && bodyTop + bodyHeight >= -previewNoteSize) {
         grouped[event.colIdx].push({ ...event, startY, endY, bodyTop, bodyHeight });
       }
     });
@@ -3832,7 +3844,7 @@ export default function UCSMobileAlpha1() {
                     </button>
 
                     {previewInfoPanelOpen && (
-                      <div className="absolute right-0 top-16 z-50 w-[260px] max-w-[72vw] rounded-l-[24px] border border-r-0 border-slate-600 bg-slate-950/92 p-3 text-white shadow-2xl backdrop-blur">
+                      <div className="absolute right-0 top-16 z-50 w-[260px] max-w-[72vw] max-h-[calc(100%-5rem)] overflow-y-auto overscroll-contain rounded-l-[24px] border border-r-0 border-slate-600 bg-slate-950/92 p-3 text-white shadow-2xl backdrop-blur">
 
                       <div className="mb-3 flex items-center justify-between gap-2">
                         <div>
@@ -3887,7 +3899,7 @@ export default function UCSMobileAlpha1() {
                         <div className="rounded-2xl bg-white/5 p-3">
                           <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">Preview Audio</div>
                           <div className="mt-2 flex items-center gap-2">
-                            <input ref={previewAudioFileInputRef} type="file" accept="audio/*" className="hidden" onChange={handlePreviewAudioFileChange} />
+                            <input ref={previewAudioFileInputRef} type="file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/mpeg,audio/mp4,audio/wav,audio/x-wav,audio/ogg,audio/webm" className="hidden" onChange={handlePreviewAudioFileChange} />
                             <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => previewAudioFileInputRef.current?.click()}>
                               Upload
                             </Button>
@@ -3931,12 +3943,13 @@ export default function UCSMobileAlpha1() {
                       </div>
                       <div className="absolute inset-x-0 top-0 z-10 grid grid-cols-5 px-5 py-3 text-center text-xs font-semibold text-slate-300">
                         {CELL_LABELS.map((label, colIdx) => (
-                          <div key={`preview-label-${label}`} className="py-2" style={{ transform: `translateX(${PREVIEW_LANE_INWARD_OFFSETS[colIdx]}px)` }}>
+                          <div key={`preview-label-${label}`} className="py-2" style={{ transform: `translateX(${previewLaneInwardOffsets[colIdx]}px)` }}>
                             {label}
                           </div>
                         ))}
                       </div>
                       <div className="pointer-events-none absolute inset-x-0 z-10 grid grid-cols-5 px-5 py-3" style={{ top: previewJudgeLineY }}>
+                        <div className="pointer-events-none absolute left-6 right-6 top-0 border-t border-cyan-200/50" style={{ transform: "translateY(2px)" }} />
                         {CELL_LABELS.map((label, colIdx) => {
                           const isFlashing = previewLaneFlash[colIdx];
                           const isHolding = previewLaneHoldActive[colIdx];
@@ -3956,7 +3969,7 @@ export default function UCSMobileAlpha1() {
                           const beatPulseGlowOpacity = beatPulseActive ? `${0.1 + previewBeatPulseStrength * 0.2}` : "0";
 
                           return (
-                            <div key={`preview-receptor-${label}`} className="relative flex justify-center" style={{ transform: `translateX(${PREVIEW_LANE_INWARD_OFFSETS[colIdx]}px)` }}>
+                            <div key={`preview-receptor-${label}`} className="relative flex justify-center" style={{ transform: `translateX(${previewLaneInwardOffsets[colIdx]}px)` }}>
                               <>
                               <div
                                 className="pointer-events-none absolute left-1/2 top-0 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-300/25 blur-md transition-opacity duration-100"
@@ -3969,8 +3982,8 @@ export default function UCSMobileAlpha1() {
                                 alt={`${label}-receptor`}
                                 className={`object-contain transition-[transform,opacity,filter] duration-100 ${shadowClass}`}
                                 style={{
-                                  width: PREVIEW_NOTE_SIZE,
-                                  height: PREVIEW_NOTE_SIZE,
+                                  width: previewNoteSize,
+                                  height: previewNoteSize,
                                   opacity: receptorOpacity,
                                   transform: `translateY(-50%) scale(${receptorScale})`,
                                   filter: `brightness(${receptorBrightness})`,
@@ -3982,7 +3995,7 @@ export default function UCSMobileAlpha1() {
                       </div>
                       <div className="absolute inset-0 z-20 grid grid-cols-5 gap-0 px-5 py-3">
                         {CELL_LABELS.map((label, colIdx) => (
-                          <div key={`preview-lane-${label}`} className="relative h-full overflow-hidden" style={{ transform: `translateX(${PREVIEW_LANE_INWARD_OFFSETS[colIdx]}px)` }}>
+                          <div key={`preview-lane-${label}`} className="relative h-full overflow-hidden" style={{ transform: `translateX(${previewLaneInwardOffsets[colIdx]}px)` }}>
                             {previewHoldEventsByLane[colIdx].map((event, holdIndex) => (
                               <React.Fragment key={`preview-hold-${colIdx}-${holdIndex}-${event.startDivIdx}-${event.startRowIdx}`}>
                                 <div
@@ -3990,22 +4003,21 @@ export default function UCSMobileAlpha1() {
                                   style={{
                                     top: event.bodyTop,
                                     height: event.bodyHeight,
-                                    width: PREVIEW_BODY_WIDTH,
+                                    width: previewBodyWidth,
                                     backgroundImage: `url(${getSpritePath(colIdx, "body")})`,
-                                    backgroundSize: `${PREVIEW_BODY_WIDTH}px 2px`,
+                                    backgroundSize: `${previewBodyWidth}px 2px`,
                                   }}
                                 />
-                                <img src={getSpritePath(colIdx, "tail")} alt={`${CELL_LABELS[colIdx]}-tail`} className="absolute left-1/2 z-10 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.endY, width: PREVIEW_NOTE_SIZE, height: PREVIEW_NOTE_SIZE }} />
-                                <img src={getSpritePath(colIdx, "head")} alt={`${CELL_LABELS[colIdx]}-head`} className="absolute left-1/2 z-20 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.startY, width: PREVIEW_NOTE_SIZE, height: PREVIEW_NOTE_SIZE }} />
+                                <img src={getSpritePath(colIdx, "tail")} alt={`${CELL_LABELS[colIdx]}-tail`} className="absolute left-1/2 z-10 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.endY, width: previewNoteSize, height: previewNoteSize }} />
+                                <img src={getSpritePath(colIdx, "head")} alt={`${CELL_LABELS[colIdx]}-head`} className="absolute left-1/2 z-20 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.startY, width: previewNoteSize, height: previewNoteSize }} />
                               </React.Fragment>
                             ))}
                             {previewTapEventsByLane[colIdx].map((event, tapIndex) => (
-                              <img key={`preview-tap-${colIdx}-${tapIndex}-${event.divIdx}-${event.rowIdx}`} src={getSpritePath(colIdx, "tap")} alt={`${CELL_LABELS[colIdx]}-tap`} className="absolute left-1/2 z-30 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.y, width: PREVIEW_NOTE_SIZE, height: PREVIEW_NOTE_SIZE }} />
+                              <img key={`preview-tap-${colIdx}-${tapIndex}-${event.divIdx}-${event.rowIdx}`} src={getSpritePath(colIdx, "tap")} alt={`${CELL_LABELS[colIdx]}-tap`} className="absolute left-1/2 z-30 -translate-x-1/2 -translate-y-1/2 object-contain" style={{ top: event.y, width: previewNoteSize, height: previewNoteSize }} />
                             ))}
                           </div>
                         ))}
                       </div>
-                      <div className="pointer-events-none absolute left-0 right-0 z-40 border-t-2 border-cyan-300/90 shadow-[0_0_14px_rgba(103,232,249,0.7)]" style={{ top: `${PREVIEW_JUDGE_LINE_RATIO * 100}%` }} />
                     </div>
                   </div>
                 </div>
