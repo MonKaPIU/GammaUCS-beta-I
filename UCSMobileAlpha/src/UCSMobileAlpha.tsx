@@ -1215,6 +1215,29 @@ function resolveEditorSyncRowByTime(previewTimingData: PreviewTimingData, timeMs
   return findNearestActualRowByTime(previewTimingData.rowEvents, timeMs);
 }
 
+function findNearestDisplayRowByTime(displayRows: DisplayRow[], timeMs: number): DisplayRow | null {
+  if (displayRows.length === 0) return null;
+
+  let nearest = displayRows[0];
+  let nearestDistance = Math.abs(displayRows[0].anchorTimeMs - timeMs);
+
+  for (let index = 1; index < displayRows.length; index += 1) {
+    const candidate = displayRows[index];
+    const distance = Math.abs(candidate.anchorTimeMs - timeMs);
+    if (distance < nearestDistance) {
+      nearest = candidate;
+      nearestDistance = distance;
+      continue;
+    }
+    if (Math.abs(distance - nearestDistance) < 0.001 && candidate.anchorTimeMs < nearest.anchorTimeMs) {
+      nearest = candidate;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
 function mirrorRowHorizontally(row: Cell[]): Cell[] {
   return [...row].reverse() as Cell[];
 }
@@ -3134,9 +3157,22 @@ export default function UCSMobileAlpha1() {
 
     const frameId = requestAnimationFrame(() => {
       const container = editorScrollRef.current;
+      if (!container) return;
+
       const targetKey = `actual:${pendingEditorSyncTarget.divIdx}:${pendingEditorSyncTarget.rowIdx}`;
-      const element = editorRowRefs.current[targetKey];
-      if (!container || !element) return;
+      let element = editorRowRefs.current[targetKey] ?? null;
+
+      if (!element) {
+        const nearestDisplayRow = findNearestDisplayRowByTime(displayRows, pendingEditorSyncTarget.timeMs);
+        if (nearestDisplayRow) {
+          element = editorRowRefs.current[nearestDisplayRow.displayKey] ?? null;
+        }
+      }
+
+      if (!element) {
+        setPendingEditorSyncTarget(null);
+        return;
+      }
 
       const judgeLineOffset = container.clientHeight * EDITOR_JUDGE_LINE_RATIO;
       const targetTop = element.offsetTop;
@@ -3196,6 +3232,23 @@ export default function UCSMobileAlpha1() {
   const selectedCellRangeSize = selectedCellRange
     ? `${selectedCellRange.totalRowCount}×${selectedCellRange.colEnd - selectedCellRange.colStart + 1}`
     : null;
+
+  const handleEditorZoomChange = (nextZoom: ZoomLevel) => {
+    if (nextZoom === zoomLevel) return;
+
+    const anchorTimeMs = editorAnchorTimeMs || currentAnchorTimeMs;
+    const nearestRow = resolveEditorSyncRowByTime(previewTimingData, anchorTimeMs)
+      ?? selectedRow
+      ?? { divIdx: selectedDivisionIdx, rowIdx: 0 };
+
+    setZoomLevel(nextZoom);
+    setPendingEditorSyncTarget({
+      divIdx: nearestRow.divIdx,
+      rowIdx: nearestRow.rowIdx,
+      timeMs: anchorTimeMs,
+    });
+    setToast(`줌을 ${nextZoom}x로 변경했습니다.`);
+  };
 
   const openResize = () => {
     setResizeDraft(String(divisions[selectedDivisionIdx].rows.length));
@@ -4004,7 +4057,7 @@ export default function UCSMobileAlpha1() {
                 <div className="mt-1 text-xs text-slate-500">새 UCS, 가져오기, 복사, 다운로드를 관리합니다.</div>
               </div>
               <div className="flex min-h-0 flex-1 flex-col space-y-4 p-4">
-                <input ref={importFileInputRef} type="file" accept=".ucs,.txt,text/plain" className="hidden" onChange={handleImportFileChange} />
+                <input ref={importFileInputRef} type="file" className="hidden" onChange={handleImportFileChange} />
                 <div className="grid gap-1">
                   <div className="text-xs font-medium text-slate-600">익스포트 파일명</div>
                   <div className="flex items-center gap-2">
@@ -4035,10 +4088,7 @@ export default function UCSMobileAlpha1() {
                             variant={zoomLevel === level ? "default" : "ghost"}
                             size="sm"
                             className="h-7 rounded-full px-2 text-[11px]"
-                            onClick={() => {
-                              setZoomLevel(level);
-                              setToast(`줌을 ${level}x로 변경했습니다.`);
-                            }}
+                            onClick={() => handleEditorZoomChange(level)}
                           >
                             {level}x
                           </Button>
