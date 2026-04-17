@@ -239,6 +239,35 @@ type PreviewLongValidationResult = {
   issues: PreviewLongValidationIssue[];
 };
 
+type PersistedAudioMeta = {
+  mode: "none" | "file";
+  fileName: string | null;
+  mimeType: string | null;
+  size: number | null;
+  durationMs: number | null;
+};
+
+type PersistedUiState = {
+  appSection: AppSection;
+  currentView: ViewMode;
+  selectedDivisionIdx: number;
+  selectedRow: RowSelection | null;
+  previewAnchorTimeMs: number;
+  previewZoom: number;
+  previewHitsoundVolume: number;
+  previewInfoPanelOpen: boolean;
+};
+
+type RecentProjectSnapshot = {
+  version: 1;
+  projectId: string;
+  updatedAt: number;
+  exportFileNameInput: string;
+  divisions: Division[];
+  ui: PersistedUiState;
+  audio: PersistedAudioMeta;
+};
+
 const CELL_LABELS = ["↙", "↖", "□", "↗", "↘"] as const;
 const ZOOM_LEVELS: ZoomLevel[] = [1, 2, 4, 8];
 const ROW_LABEL_WIDTH = "w-20";
@@ -270,6 +299,12 @@ const ALLOWED_PREVIEW_AUDIO_MIME_TYPES = new Set([
   "audio/mp4",
 ]);
 const ALLOWED_PREVIEW_AUDIO_EXTENSIONS = [".mp3", ".wav", ".ogg", ".m4a", ".webm"] as const;
+const RECENT_PROJECT_SCHEMA_VERSION = 1 as const;
+const RECENT_PROJECT_ID = "autosave-recent";
+const RECENT_PROJECT_DB_NAME = "ucs-mobile-alpha-db";
+const RECENT_PROJECT_STORE_NAME = "recent-projects";
+const RECENT_PROJECT_LAST_ID_KEY = "ucs-mobile-alpha:last-project-id";
+const RECENT_PROJECT_AUTOSAVE_DELAY_MS = 1000;
 
 const parseRows = (rows: string[]): Cell[][] => rows.map((r) => r.split("") as Cell[]);
 
@@ -1026,6 +1061,70 @@ if (isDevRuntime) {
   runUcsParserSelfChecks();
 }
 
+function setRecentProjectLastId(projectId: string) {
+  try {
+    window.localStorage.setItem(RECENT_PROJECT_LAST_ID_KEY, projectId);
+  } catch {
+    // noop
+  }
+}
+
+function getRecentProjectLastId(): string | null {
+  try {
+    return window.localStorage.getItem(RECENT_PROJECT_LAST_ID_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function openRecentProjectDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === "undefined" || !("indexedDB" in window)) {
+      reject(new Error("IndexedDB를 사용할 수 없습니다."));
+      return;
+    }
+
+    const request = window.indexedDB.open(RECENT_PROJECT_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(RECENT_PROJECT_STORE_NAME)) {
+        db.createObjectStore(RECENT_PROJECT_STORE_NAME, { keyPath: "projectId" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("최근 작업 DB를 열지 못했습니다."));
+  });
+}
+
+async function saveRecentProjectSnapshot(snapshot: RecentProjectSnapshot): Promise<void> {
+  const db = await openRecentProjectDb();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(RECENT_PROJECT_STORE_NAME, "readwrite");
+    const store = transaction.objectStore(RECENT_PROJECT_STORE_NAME);
+    store.put(snapshot);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("최근 작업 저장에 실패했습니다."));
+    transaction.onabort = () => reject(transaction.error ?? new Error("최근 작업 저장이 중단되었습니다."));
+  });
+  db.close();
+  setRecentProjectLastId(snapshot.projectId);
+}
+
+async function loadRecentProjectSnapshot(): Promise<RecentProjectSnapshot | null> {
+  const projectId = getRecentProjectLastId() ?? RECENT_PROJECT_ID;
+  const db = await openRecentProjectDb();
+  const snapshot = await new Promise<RecentProjectSnapshot | null>((resolve, reject) => {
+    const transaction = db.transaction(RECENT_PROJECT_STORE_NAME, "readonly");
+    const store = transaction.objectStore(RECENT_PROJECT_STORE_NAME);
+    const request = store.get(projectId);
+    request.onsuccess = () => resolve((request.result as RecentProjectSnapshot | undefined) ?? null);
+    request.onerror = () => reject(request.error ?? new Error("최근 작업 불러오기에 실패했습니다."));
+  });
+  db.close();
+  if (!snapshot || snapshot.version !== RECENT_PROJECT_SCHEMA_VERSION) return null;
+  return snapshot;
+}
+
 function findNearestActualRowByTime(rowEvents: PreviewRowEvent[], timeMs: number): RowSelection | null {
   if (rowEvents.length === 0) return null;
 
@@ -1502,6 +1601,15 @@ export default function UCSMobileAlpha1() {
   const [previewAudioStatus, setPreviewAudioStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [previewAudioError, setPreviewAudioError] = useState("");
   const [previewAudioDurationMs, setPreviewAudioDurationMs] = useState<number | null>(null);
+  const [recentAudioMeta, setRecentAudioMeta] = useState<PersistedAudioMeta>({
+    mode: "none",
+    fileName: null,
+    mimeType: null,
+    size: null,
+    durationMs: null,
+  });
+  const [previewAudioReconnectNeeded, setPreviewAudioReconnectNeeded] = useState(false);
+  const [recentProjectAutosaveReady, setRecentProjectAutosaveReady] = useState(false);
   const [editorAnchorTimeMs, setEditorAnchorTimeMs] = useState(0);
   const [appViewportHeight, setAppViewportHeight] = useState<number>(() => (typeof window !== "undefined" ? window.innerHeight : 844));
   const [appViewportWidth, setAppViewportWidth] = useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 390));
@@ -1532,6 +1640,8 @@ export default function UCSMobileAlpha1() {
   });
   const [previewLaneFlash, setPreviewLaneFlash] = useState<boolean[]>(() => Array(CELL_LABELS.length).fill(false));
   const [previewInfoPanelOpen, setPreviewInfoPanelOpen] = useState(true);
+  const recentProjectSaveTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const latestRecentProjectSnapshotRef = useRef<RecentProjectSnapshot | null>(null);
   const previewLaneFlashTimeoutsRef = useRef<Array<ReturnType<typeof window.setTimeout> | null>>(
     Array.from({ length: CELL_LABELS.length }, () => null),
   );
@@ -1636,7 +1746,7 @@ export default function UCSMobileAlpha1() {
 
   const downloadUcsFile = () => {
     try {
-      const blob = new Blob([serializedUcs], { type: "text/plain;charset=utf-8" });
+      const blob = new Blob([serializedUcs], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -1718,6 +1828,193 @@ export default function UCSMobileAlpha1() {
     setToast(`${sourceLabel}에서 UCS를 불러왔습니다. Division ${importedDivisions.length}개, 전체 ${totalRows}행입니다.`);
   };
 
+  const clearRecentProjectSaveTimeout = () => {
+    if (recentProjectSaveTimeoutRef.current !== null) {
+      window.clearTimeout(recentProjectSaveTimeoutRef.current);
+      recentProjectSaveTimeoutRef.current = null;
+    }
+  };
+
+  const buildRecentProjectSnapshot = (): RecentProjectSnapshot => ({
+    version: RECENT_PROJECT_SCHEMA_VERSION,
+    projectId: RECENT_PROJECT_ID,
+    updatedAt: Date.now(),
+    exportFileNameInput,
+    divisions: cloneDivisions(divisions),
+    ui: {
+      appSection,
+      currentView,
+      selectedDivisionIdx,
+      selectedRow: selectedRow ? { ...selectedRow } : null,
+      previewAnchorTimeMs,
+      previewZoom,
+      previewHitsoundVolume,
+      previewInfoPanelOpen,
+    },
+    audio: {
+      ...recentAudioMeta,
+      durationMs: recentAudioMeta.mode === "file" ? previewAudioDurationMs ?? recentAudioMeta.durationMs : recentAudioMeta.durationMs,
+    },
+  });
+
+  const persistRecentProjectNow = async (snapshot: RecentProjectSnapshot, notifyOnError = false) => {
+    try {
+      await saveRecentProjectSnapshot(snapshot);
+      latestRecentProjectSnapshotRef.current = snapshot;
+    } catch {
+      if (notifyOnError) {
+        setToast("자동 저장에 실패했습니다.");
+      }
+    }
+  };
+
+  const applyRecentProjectSnapshot = (snapshot: RecentProjectSnapshot) => {
+    const nextDivisions = snapshot.divisions.length > 0 ? cloneDivisions(snapshot.divisions) : cloneDivisions(initialDivisions);
+    const nextTimingData = buildPreviewTimingData(nextDivisions);
+    const nextSelectedDivisionIdx = Math.max(0, Math.min(snapshot.ui.selectedDivisionIdx, nextDivisions.length - 1));
+    const rawSelectedRow = snapshot.ui.selectedRow;
+    const nextSelectedRow = rawSelectedRow && nextDivisions[rawSelectedRow.divIdx]?.rows[rawSelectedRow.rowIdx]
+      ? { divIdx: rawSelectedRow.divIdx, rowIdx: rawSelectedRow.rowIdx }
+      : null;
+    const restoredAnchorTimeMs = Math.max(
+      nextTimingData.chartStartTimeMs,
+      Math.min(nextTimingData.chartEndTimeMs, snapshot.ui.previewAnchorTimeMs),
+    );
+    const restoredScrollBeat = getPreviewScrollBeatByTime(nextTimingData.divisionSpans, restoredAnchorTimeMs);
+    const restoredZoom = normalizePreviewZoom(snapshot.ui.previewZoom);
+    const restoredVolume = normalizeHitsoundVolume(snapshot.ui.previewHitsoundVolume);
+    const restoredAudioMeta = snapshot.audio ?? {
+      mode: "none",
+      fileName: null,
+      mimeType: null,
+      size: null,
+      durationMs: null,
+    };
+    const hasReconnectableAudio = restoredAudioMeta.mode === "file" && Boolean(restoredAudioMeta.fileName);
+
+    setDivisions(nextDivisions);
+    setExportFileNameInput(sanitizeUcsFileNameInput(stripUcsExtension(snapshot.exportFileNameInput)) || "untitled");
+    setSelectedDivisionIdx(nextSelectedDivisionIdx);
+    setSelectedRow(nextSelectedRow);
+    setMultiSelectedRows([]);
+    setSelectedCellRange(null);
+    setRangeAnchor(null);
+    setPendingLongStart(null);
+    setIsTemporaryLongStart(false);
+    setManualExpandedGroups([]);
+    setMode("note");
+    setSelectTool("row_single");
+    setAppSection(snapshot.ui.appSection);
+    setCurrentView(snapshot.ui.currentView);
+    setPreviewAnchorTimeMs(restoredAnchorTimeMs);
+    setPreviewCursorTimeMs(restoredAnchorTimeMs);
+    setPreviewCursorScrollBeat(restoredScrollBeat);
+    setPreviewZoom(restoredZoom);
+    setPreviewZoomDraft(restoredZoom.toFixed(1));
+    setPreviewHitsoundVolume(restoredVolume);
+    setPreviewInfoPanelOpen(snapshot.ui.previewInfoPanelOpen);
+    setEditorAnchorTimeMs(restoredAnchorTimeMs);
+    setPendingEditorSyncTarget(nextSelectedRow && snapshot.ui.currentView === "editor" ? { ...nextSelectedRow, timeMs: restoredAnchorTimeMs } : null);
+    previewPlaybackRequestIdRef.current += 1;
+    previewPlaybackUsesAudioClockRef.current = false;
+    previewPlaybackBaseRef.current = restoredAnchorTimeMs;
+    previewPlaybackStartedAtRef.current = null;
+    previewLastHitsoundRowIndexRef.current = -1;
+    setIsPlaying(false);
+    previewAudioRef.current?.pause();
+    setPreviewAudioSrc("");
+    setPreviewAudioMode("none");
+    setPreviewAudioReconnectNeeded(hasReconnectableAudio);
+    setPreviewAudioLabel(hasReconnectableAudio ? `이전 오디오: ${restoredAudioMeta.fileName}` : "오디오 없음");
+    setPreviewAudioStatus("idle");
+    setPreviewAudioError("");
+    setPreviewAudioDurationMs(null);
+    setRecentAudioMeta(restoredAudioMeta);
+    setToast(hasReconnectableAudio ? "최근 작업과 오디오 메타를 복원했습니다. 오디오는 다시 연결해야 합니다." : "최근 작업을 복원했습니다.");
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const restoreRecentProject = async () => {
+      try {
+        const snapshot = await loadRecentProjectSnapshot();
+        if (cancelled) return;
+        if (snapshot) {
+          latestRecentProjectSnapshotRef.current = snapshot;
+          applyRecentProjectSnapshot(snapshot);
+        }
+      } catch {
+        if (!cancelled) {
+          setToast("최근 작업 복원 없이 새 세션으로 시작합니다.");
+        }
+      } finally {
+        if (!cancelled) {
+          setRecentProjectAutosaveReady(true);
+          latestRecentProjectSnapshotRef.current = latestRecentProjectSnapshotRef.current ?? buildRecentProjectSnapshot();
+        }
+      }
+    };
+
+    void restoreRecentProject();
+
+    return () => {
+      cancelled = true;
+      clearRecentProjectSaveTimeout();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!recentProjectAutosaveReady) return;
+
+    const snapshot = buildRecentProjectSnapshot();
+    latestRecentProjectSnapshotRef.current = snapshot;
+    clearRecentProjectSaveTimeout();
+    recentProjectSaveTimeoutRef.current = window.setTimeout(() => {
+      void persistRecentProjectNow(snapshot, true);
+      recentProjectSaveTimeoutRef.current = null;
+    }, RECENT_PROJECT_AUTOSAVE_DELAY_MS);
+
+    return clearRecentProjectSaveTimeout;
+  }, [
+    recentProjectAutosaveReady,
+    divisions,
+    exportFileNameInput,
+    appSection,
+    currentView,
+    selectedDivisionIdx,
+    selectedRow,
+    previewAnchorTimeMs,
+    previewZoom,
+    previewHitsoundVolume,
+    previewInfoPanelOpen,
+    recentAudioMeta,
+    previewAudioDurationMs,
+  ]);
+
+  useEffect(() => {
+    const flushRecentProject = () => {
+      if (!recentProjectAutosaveReady) return;
+      const snapshot = latestRecentProjectSnapshotRef.current ?? buildRecentProjectSnapshot();
+      latestRecentProjectSnapshotRef.current = snapshot;
+      clearRecentProjectSaveTimeout();
+      void persistRecentProjectNow(snapshot, false);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        flushRecentProject();
+      }
+    };
+
+    window.addEventListener("pagehide", flushRecentProject);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", flushRecentProject);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [recentProjectAutosaveReady]);
+
   const importUcsFromText = () => {
     const source = importTextDraft.trim();
     if (!source) {
@@ -1727,16 +2024,21 @@ export default function UCSMobileAlpha1() {
 
     const sourceBytes = getTextByteLength(source);
     if (sourceBytes > MAX_UCS_IMPORT_BYTES) {
-      setToast(`텍스트 가져오기 실패${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(sourceBytes)}입니다.`);
+      setToast(
+        `텍스트 가져오기 실패${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(sourceBytes)}입니다.`,
+      );
       return;
     }
 
     try {
       const importedDivisions = parseUcsText(source);
-      applyImportedDivisions(importedDivisions, "텍스트");
+      applyImportedDivisions(importedDivisions, "텍스트 붙여넣기");
     } catch (error) {
-      const message = formatUcsImportErrorMessage(error, "텍스트");
-      setToast(message);
+      setToast(
+        error instanceof Error
+          ? `텍스트 가져오기 실패${String.fromCharCode(10)}${error.message}`
+          : "텍스트 가져오기에 실패했습니다.",
+      );
     }
   };
 
@@ -1746,7 +2048,9 @@ export default function UCSMobileAlpha1() {
     if (!file) return;
 
     if (file.size > MAX_UCS_IMPORT_BYTES) {
-      setToast(`파일 가져오기 실패 · ${file.name}${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(file.size)}입니다.`);
+      setToast(
+        `파일 가져오기 실패 · ${file.name}${String.fromCharCode(10)}UCS 데이터 크기는 최대 ${formatImportSize(MAX_UCS_IMPORT_BYTES)}까지만 가져올 수 있습니다. 현재 ${formatImportSize(file.size)}입니다.`,
+      );
       return;
     }
 
@@ -1759,6 +2063,7 @@ export default function UCSMobileAlpha1() {
       setToast(message);
     }
   };
+
   useEffect(() => {
     const updateViewportSize = () => {
       setAppViewportHeight(window.innerHeight);
@@ -1818,7 +2123,7 @@ export default function UCSMobileAlpha1() {
     previewPlaybackBaseRef.current = nextTimeMs;
     previewPlaybackStartedAtRef.current = null;
     syncPreviewHitsoundPointer(nextTimeMs);
-    writePreviewAudioTime(nextTimeMs)
+    writePreviewAudioTime(nextTimeMs);
     return nextTimeMs;
   };
 
@@ -1835,7 +2140,6 @@ export default function UCSMobileAlpha1() {
     writePreviewAudioTime(nextTimeMs);
     return nextScrollBeat;
   };
-
 
   const handlePreviewWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     if (isPlaying) return;
@@ -2095,7 +2399,7 @@ export default function UCSMobileAlpha1() {
       previewPlaybackBaseRef.current = nextTimeMs;
       previewPlaybackStartedAtRef.current = performance.now();
       setIsPlaying(true);
-      setToast(successMessage);
+      setToast(previewAudioReconnectNeeded ? "오디오가 아직 다시 연결되지 않아 차트만 재생합니다." : successMessage);
       return;
     }
 
@@ -2164,14 +2468,17 @@ export default function UCSMobileAlpha1() {
         setPreviewAudioSrc("");
         setPreviewAudioLabel("오디오 없음");
         setPreviewAudioMode("none");
+        setPreviewAudioReconnectNeeded(false);
         setPreviewAudioStatus("error");
         setPreviewAudioError(`오디오 길이는 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지만 허용됩니다. 현재 ${formatDurationLabel(durationMs)}입니다.`);
         setPreviewAudioDurationMs(null);
+        setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
         if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
         setToast(`오디오 길이 제한을 초과했습니다. 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지 업로드할 수 있습니다.`);
         return;
       }
       setPreviewAudioDurationMs(durationMs);
+      setRecentAudioMeta((prev) => (prev.mode === "file" ? { ...prev, durationMs } : prev));
     };
 
     const handleCanPlay = () => {
@@ -2210,7 +2517,7 @@ export default function UCSMobileAlpha1() {
       setPreviewAudioDurationMs(null);
       audio.src = previewAudioSrc;
       audio.load();
-      writePreviewAudioTime(previewCursorTimeMs)
+      writePreviewAudioTime(previewCursorTimeMs);
     }
 
     return () => {
@@ -2231,7 +2538,7 @@ export default function UCSMobileAlpha1() {
 
     if (currentView !== "preview" || !isPlaying) {
       audio.pause();
-      writePreviewAudioTime(previewCursorTimeMs)
+      writePreviewAudioTime(previewCursorTimeMs);
     }
   }, [currentView, isPlaying, previewAudioSrc, previewCursorTimeMs]);
 
@@ -2259,15 +2566,32 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioSrc("");
     setPreviewAudioLabel("오디오 없음");
     setPreviewAudioMode("none");
+    setPreviewAudioReconnectNeeded(false);
     setPreviewAudioStatus("idle");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
+    setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
     if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
     setToast("프리뷰 오디오를 제거했습니다.");
   };
 
+  const dismissPreviewAudioReconnect = () => {
+    previewPlaybackUsesAudioClockRef.current = false;
+    setPreviewAudioSrc("");
+    setPreviewAudioLabel("오디오 없음");
+    setPreviewAudioMode("none");
+    setPreviewAudioReconnectNeeded(false);
+    setPreviewAudioStatus("idle");
+    setPreviewAudioError("");
+    setPreviewAudioDurationMs(null);
+    setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
+    if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
+    setToast("이전 오디오 다시 연결 안내를 해제했습니다.");
+  };
+
   const handlePreviewAudioFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    const reconnectExpectedFileName = previewAudioReconnectNeeded ? recentAudioMeta.fileName : null;
     if (!file) return;
 
     if (file.size > MAX_PREVIEW_AUDIO_BYTES) {
@@ -2296,10 +2620,26 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioSrc(objectUrl);
     setPreviewAudioLabel(file.name);
     setPreviewAudioMode("file");
+    setPreviewAudioReconnectNeeded(false);
     setPreviewAudioStatus("loading");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
-    setToast(`오디오 파일을 불러왔습니다: ${file.name}`);
+    setRecentAudioMeta({
+      mode: "file",
+      fileName: file.name,
+      mimeType: file.type || null,
+      size: file.size,
+      durationMs: null,
+    });
+    if (reconnectExpectedFileName) {
+      setToast(
+        reconnectExpectedFileName === file.name
+          ? `이전 오디오를 다시 연결했습니다: ${file.name}`
+          : `이전 오디오와 다른 파일로 연결했습니다: ${file.name}`,
+      );
+    } else {
+      setToast(`오디오 파일을 불러왔습니다: ${file.name}`);
+    }
     event.target.value = "";
   };
 
@@ -2339,7 +2679,7 @@ export default function UCSMobileAlpha1() {
     setPreviewCursorTimeMs(startTime);
     setPreviewCursorScrollBeat(startScrollBeat);
     syncPreviewHitsoundPointer(startTime);
-    writePreviewAudioTime(startTime)
+    writePreviewAudioTime(startTime);
     previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = startTime;
     previewPlaybackStartedAtRef.current = null;
@@ -2840,17 +3180,17 @@ export default function UCSMobileAlpha1() {
     ? `임시 롱모드: 시작 ${CELL_LABELS[pendingLongStart.colIdx]} / ${pendingLongStart.rowIdx + 1}행 · 끝점을 선택하거나 모드를 바꾸세요.`
     : pendingLongStart
       ? `시작: ${CELL_LABELS[pendingLongStart.colIdx]} / ${pendingLongStart.rowIdx + 1}행 · 디비전이 달라도 같은 열이면 끝점으로 선택할 수 있습니다`
-    : mode === "note"
-      ? "빈 칸 탭 = X 생성 · 기존 노트 탭 = 삭제"
-      : mode === "long"
-        ? "롱노트 시작점을 선택하세요"
-        : selectTool === "row_single"
-          ? "행 단일 선택: 행 라벨이나 셀을 눌러 한 행만 선택합니다. 좌우반전은 선택된 행 전체에 적용됩니다."
-          : rangeAnchor?.kind === "row"
-            ? "행 범위 선택 중: 끝 행도 같은 종류(행 라벨)로 선택하세요. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 행을 선택할 수 있습니다."
-            : rangeAnchor?.kind === "cell"
-              ? "셀 범위 선택 중: 끝 셀도 같은 종류(셀)로 선택하세요. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 행을 포함할 수 있으며, 좌우반전은 선택한 열 범위 내부에만 적용됩니다."
-              : "범위 선택: 첫 클릭이 행 라벨이면 행 범위, 셀이면 셀 범위입니다. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 선택할 수 있고, 좌우반전은 현재 선택 종류에 맞춰 다르게 실행됩니다.";
+      : mode === "note"
+        ? "빈 칸 탭 = X 생성 · 기존 노트 탭 = 삭제"
+        : mode === "long"
+          ? "롱노트 시작점을 선택하세요"
+          : selectTool === "row_single"
+            ? "행 단일 선택: 행 라벨이나 셀을 눌러 한 행만 선택합니다. 좌우반전은 선택된 행 전체에 적용됩니다."
+            : rangeAnchor?.kind === "row"
+              ? "행 범위 선택 중: 끝 행도 같은 종류(행 라벨)로 선택하세요. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 행을 선택할 수 있습니다."
+              : rangeAnchor?.kind === "cell"
+                ? "셀 범위 선택 중: 끝 셀도 같은 종류(셀)로 선택하세요. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 행을 포함할 수 있으며, 좌우반전은 선택한 열 범위 내부에만 적용됩니다."
+                : "범위 선택: 첫 클릭이 행 라벨이면 행 범위, 셀이면 셀 범위입니다. 다른 종류를 누르면 취소됩니다. 디비전을 넘어 연속 선택할 수 있고, 좌우반전은 현재 선택 종류에 맞춰 다르게 실행됩니다.";
 
   const selectedCountInCurrentDivision = multiSelectedRows.filter((r) => r.divIdx === selectedDivisionIdx).length;
   const selectedCellRangeSize = selectedCellRange
@@ -3251,6 +3591,7 @@ export default function UCSMobileAlpha1() {
     const newDivision: Division = {
       ...current,
       id: `${current.id}-split-${Date.now()}`,
+      delay: 0,
       rows: lowerRows,
     };
     next.splice(selectedDivisionIdx + 1, 0, newDivision);
@@ -3280,7 +3621,7 @@ export default function UCSMobileAlpha1() {
     const newDivision: Division = {
       id: `${current.id}-insert-${Date.now()}`,
       bpm: current.bpm,
-      delay: current.delay,
+      delay: 0,
       beat: current.beat,
       split: current.split,
       rows: Array.from({ length: current.beat * current.split }, () => emptyRow()),
@@ -3731,7 +4072,7 @@ export default function UCSMobileAlpha1() {
                                   <div className="my-3 rounded-2xl border border-slate-300 bg-slate-50 px-3 py-2">
                                     <div className="flex items-center justify-between gap-2">
                                       <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Division {item.divIdx + 1}</div>
-                                      <div className="text-[11px] text-slate-500">BPM {divisions[item.divIdx].bpm} · Split {divisions[item.divIdx].split}</div>
+                                      <div className="text-[11px] text-slate-500">BPM {divisions[item.divIdx].bpm} · Split {divisions[item.divIdx].split} · Delay {formatRounded(divisions[item.divIdx].delay, 3)} ms</div>
                                     </div>
                                   </div>
                                 )}
@@ -3775,7 +4116,7 @@ export default function UCSMobileAlpha1() {
                                 <div className="my-3 rounded-2xl border border-slate-300 bg-slate-50 px-3 py-2">
                                   <div className="flex items-center justify-between gap-2">
                                     <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Division {item.divIdx + 1}</div>
-                                    <div className="text-[11px] text-slate-500">BPM {divisions[item.divIdx].bpm} · Split {divisions[item.divIdx].split}</div>
+                                    <div className="text-[11px] text-slate-500">BPM {divisions[item.divIdx].bpm} · Split {divisions[item.divIdx].split} · Delay {formatRounded(divisions[item.divIdx].delay, 3)} ms</div>
                                   </div>
                                 </div>
                               )}
@@ -3906,18 +4247,29 @@ export default function UCSMobileAlpha1() {
                           <div className="mt-2 flex items-center gap-2">
                             <input ref={previewAudioFileInputRef} type="file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/mpeg,audio/mp4,audio/wav,audio/x-wav,audio/ogg,audio/webm" className="hidden" onChange={handlePreviewAudioFileChange} />
                             <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => previewAudioFileInputRef.current?.click()}>
-                              Upload
+                              {previewAudioReconnectNeeded ? "다시 연결" : previewAudioSrc ? "교체" : "Upload"}
                             </Button>
-                            <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={clearPreviewAudio} disabled={!previewAudioSrc}>
-                              Clear
-                            </Button>
+                            {previewAudioReconnectNeeded ? (
+                              <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={dismissPreviewAudioReconnect}>
+                                무시
+                              </Button>
+                            ) : (
+                              <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={clearPreviewAudio} disabled={!previewAudioSrc}>
+                                Clear
+                              </Button>
+                            )}
                           </div>
                           <div className="mt-2 rounded-xl bg-slate-900/40 px-3 py-2 text-[11px] text-slate-400">원격 URL 입력은 배포 보안 설정에 따라 숨겨져 있습니다.</div>
+                          {previewAudioReconnectNeeded && (
+                            <div className="mt-2 rounded-xl bg-amber-400/10 px-3 py-2 text-[11px] text-amber-100">
+                              최근 작업은 복원되었지만 오디오 파일은 다시 선택해야 합니다.
+                            </div>
+                          )}
                           <div className="mt-2 text-[11px] text-slate-400">{previewAudioLabel}</div>
                           <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
-                            <span>{previewAudioMode === "none" ? "OFF" : previewAudioMode.toUpperCase()}</span>
+                            <span>{previewAudioReconnectNeeded ? "RECONNECT" : previewAudioMode === "none" ? "OFF" : previewAudioMode.toUpperCase()}</span>
                             <span>·</span>
-                            <span>{previewAudioStatus === "idle" ? "IDLE" : previewAudioStatus === "loading" ? "LOADING" : previewAudioStatus === "ready" ? "READY" : "ERROR"}</span>
+                            <span>{previewAudioReconnectNeeded ? "RECONNECT NEEDED" : previewAudioStatus === "idle" ? "IDLE" : previewAudioStatus === "loading" ? "LOADING" : previewAudioStatus === "ready" ? "READY" : "ERROR"}</span>
                           </div>
                           {previewAudioError && <div className="mt-2 rounded-xl bg-red-500/15 px-3 py-2 text-[11px] text-red-200">{previewAudioError}</div>}
                         </div>
@@ -4388,3 +4740,4 @@ export default function UCSMobileAlpha1() {
     </div>
   );
 }
+
