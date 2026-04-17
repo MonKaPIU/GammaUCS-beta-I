@@ -55,10 +55,23 @@ type LongStart = {
   colIdx: number;
 };
 
-type ClipboardData = {
+type FlatClipboardData = {
   rows: ClipboardCell[][];
   rowCount: number;
   effectiveColCount: number;
+};
+
+type InsertClipboardDivision = {
+  bpm: number;
+  delay: number;
+  beat: number;
+  split: number;
+  rows: Cell[][];
+};
+
+type InsertClipboardData = {
+  divisions: InsertClipboardDivision[];
+  totalRowCount: number;
 };
 
 type PropertyDraft = {
@@ -1256,7 +1269,7 @@ function createClipboardRow(): ClipboardCell[] {
   return ["*", "*", "*", "*", "*"];
 }
 
-function toClipboardRowsFromSelectedCells(divisions: Division[], selection: CellRangeSelection): ClipboardData {
+function toClipboardRowsFromSelectedCells(divisions: Division[], selection: CellRangeSelection): FlatClipboardData {
   const rows: ClipboardCell[][] = [];
   const effectiveColCount = selection.colEnd - selection.colStart + 1;
   selection.segments.forEach((segment) => {
@@ -1275,12 +1288,70 @@ function toClipboardRowsFromSelectedCells(divisions: Division[], selection: Cell
   };
 }
 
-function toClipboardRowsFromSelectedRows(divisions: Division[], targets: RowSelection[]): ClipboardData {
+function toClipboardRowsFromSelectedRows(divisions: Division[], targets: RowSelection[]): FlatClipboardData {
   const rows = targets.map(({ divIdx, rowIdx }) => [...divisions[divIdx].rows[rowIdx]] as ClipboardCell[]);
   return {
     rows,
     rowCount: rows.length,
     effectiveColCount: 5,
+  };
+}
+
+function buildInsertClipboardFromSelectedCells(divisions: Division[], selection: CellRangeSelection): InsertClipboardData {
+  const divisionPayloads: InsertClipboardDivision[] = selection.segments
+    .map((segment) => {
+      const sourceDivision = divisions[segment.divIdx];
+      const rows: Cell[][] = [];
+
+      for (let rowIdx = segment.rowStart; rowIdx <= segment.rowEnd; rowIdx += 1) {
+        const nextRow = emptyRow();
+        for (let sourceColIdx = selection.colStart; sourceColIdx <= selection.colEnd; sourceColIdx += 1) {
+          nextRow[sourceColIdx - selection.colStart] = divisions[segment.divIdx].rows[rowIdx][sourceColIdx];
+        }
+        rows.push(nextRow);
+      }
+
+      return {
+        bpm: sourceDivision.bpm,
+        delay: sourceDivision.delay,
+        beat: sourceDivision.beat,
+        split: sourceDivision.split,
+        rows,
+      };
+    })
+    .filter((division) => division.rows.length > 0);
+
+  return {
+    divisions: divisionPayloads,
+    totalRowCount: divisionPayloads.reduce((sum, division) => sum + division.rows.length, 0),
+  };
+}
+
+function buildInsertClipboardFromSelectedRows(divisions: Division[], targets: RowSelection[]): InsertClipboardData {
+  const divisionPayloads: InsertClipboardDivision[] = [];
+  let activeDivIdx: number | null = null;
+  let activePayload: InsertClipboardDivision | null = null;
+
+  targets.forEach(({ divIdx, rowIdx }) => {
+    if (activeDivIdx !== divIdx || !activePayload) {
+      const sourceDivision = divisions[divIdx];
+      activePayload = {
+        bpm: sourceDivision.bpm,
+        delay: sourceDivision.delay,
+        beat: sourceDivision.beat,
+        split: sourceDivision.split,
+        rows: [],
+      };
+      divisionPayloads.push(activePayload);
+      activeDivIdx = divIdx;
+    }
+
+    activePayload.rows.push([...divisions[divIdx].rows[rowIdx]] as Cell[]);
+  });
+
+  return {
+    divisions: divisionPayloads,
+    totalRowCount: divisionPayloads.reduce((sum, division) => sum + division.rows.length, 0),
   };
 }
 
@@ -1602,7 +1673,8 @@ export default function UCSMobileAlpha1() {
   const [multiSelectedRows, setMultiSelectedRows] = useState<RowSelection[]>([]);
   const [selectedCellRange, setSelectedCellRange] = useState<CellRangeSelection | null>(null);
   const [rangeAnchor, setRangeAnchor] = useState<RangeAnchor | null>(null);
-  const [clipboardData, setClipboardData] = useState<ClipboardData | null>(null);
+  const [flatClipboardData, setFlatClipboardData] = useState<FlatClipboardData | null>(null);
+  const [insertClipboardData, setInsertClipboardData] = useState<InsertClipboardData | null>(null);
   const [pendingLongStart, setPendingLongStart] = useState<LongStart | null>(null);
   const [isTemporaryLongStart, setIsTemporaryLongStart] = useState(false);
   const [manualExpandedGroups, setManualExpandedGroups] = useState<string[]>([]);
@@ -1636,6 +1708,7 @@ export default function UCSMobileAlpha1() {
   const [editorAnchorTimeMs, setEditorAnchorTimeMs] = useState(0);
   const [appViewportHeight, setAppViewportHeight] = useState<number>(() => (typeof window !== "undefined" ? window.innerHeight : 844));
   const [appViewportWidth, setAppViewportWidth] = useState<number>(() => (typeof window !== "undefined" ? window.innerWidth : 390));
+  const [bottomBarHeight, setBottomBarHeight] = useState(118);
   const [pendingEditorSyncTarget, setPendingEditorSyncTarget] = useState<EditorSyncTarget | null>(null);
   const previewPlaybackBaseRef = useRef(0);
   const previewPlaybackStartedAtRef = useRef<number | null>(null);
@@ -1646,6 +1719,7 @@ export default function UCSMobileAlpha1() {
   const previewLastHitsoundRowIndexRef = useRef(-1);
   const previewPlaybackRequestIdRef = useRef(0);
   const previewPlaybackUsesAudioClockRef = useRef(false);
+  const previewAutoRecoverAtRef = useRef(0);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioFileInputRef = useRef<HTMLInputElement | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1689,6 +1763,7 @@ export default function UCSMobileAlpha1() {
   const [undoStack, setUndoStack] = useState<EditorSnapshot[]>([]);
   const editorScrollRef = useRef<HTMLDivElement | null>(null);
   const editorRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const bottomBarRef = useRef<HTMLDivElement | null>(null);
 
   const clearAllSelection = () => {
     setSelectedRow(null);
@@ -2096,6 +2171,30 @@ export default function UCSMobileAlpha1() {
     window.addEventListener("resize", updateViewportSize);
     return () => window.removeEventListener("resize", updateViewportSize);
   }, []);
+
+  useEffect(() => {
+    const element = bottomBarRef.current;
+    if (!element) return;
+
+    const updateBottomBarHeight = () => {
+      const rect = element.getBoundingClientRect();
+      const safeHeight = Math.max(0, Math.ceil(rect.height));
+      setBottomBarHeight((prev) => (prev === safeHeight ? prev : safeHeight));
+    };
+
+    updateBottomBarHeight();
+
+    const resizeObserver = new ResizeObserver(() => {
+      updateBottomBarHeight();
+    });
+    resizeObserver.observe(element);
+    window.addEventListener("resize", updateBottomBarHeight);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", updateBottomBarHeight);
+    };
+  }, [appSection, currentView, mode, selectTool, selectedCellRange, rangeAnchor, pendingLongStart, isTemporaryLongStart]);
 
   const previewViewportHeight = Math.max(320, Math.min(560, appViewportHeight - 250));
   const previewAppWidth = Math.min(appViewportWidth, 448);
@@ -2666,6 +2765,176 @@ export default function UCSMobileAlpha1() {
     event.target.value = "";
   };
 
+  const recoverPreviewSoundState = async () => {
+    const now = Date.now();
+    if (now - previewAutoRecoverAtRef.current < 400) return;
+    previewAutoRecoverAtRef.current = now;
+
+    const hitsoundContext = await resumePreviewHitsoundContext();
+    if (hitsoundContext?.state === "running") {
+      void ensurePreviewHitsoundBuffer();
+    }
+
+    const audio = previewAudioRef.current;
+    if (!audio || !previewAudioSrc) {
+      syncPreviewHitsoundPointer(previewCursorTimeMs);
+      return;
+    }
+
+    if (audio.readyState === 0) {
+      try {
+        audio.load();
+      } catch {
+        // noop
+      }
+    }
+
+    if (!isPlaying) {
+      writePreviewAudioTime(previewCursorTimeMs);
+      syncPreviewHitsoundPointer(previewCursorTimeMs);
+      return;
+    }
+
+    const fallbackTimeMs = previewPlaybackUsesAudioClockRef.current
+      ? Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, audio.currentTime * 1000))
+      : previewCursorTimeMs;
+
+    try {
+      if (audio.paused) {
+        const playResult = audio.play();
+        if (playResult !== undefined) {
+          await playResult;
+        }
+      }
+
+      const resumedTimeMs = Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, audio.currentTime * 1000));
+      previewPlaybackUsesAudioClockRef.current = true;
+      previewPlaybackBaseRef.current = resumedTimeMs;
+      previewPlaybackStartedAtRef.current = null;
+      setPreviewAnchorTimeMs(resumedTimeMs);
+      setPreviewCursorTimeMs(resumedTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, resumedTimeMs));
+      syncPreviewHitsoundPointer(resumedTimeMs);
+    } catch {
+      previewPlaybackUsesAudioClockRef.current = false;
+      previewPlaybackBaseRef.current = fallbackTimeMs;
+      previewPlaybackStartedAtRef.current = performance.now();
+      setPreviewAnchorTimeMs(fallbackTimeMs);
+      setPreviewCursorTimeMs(fallbackTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, fallbackTimeMs));
+      syncPreviewHitsoundPointer(fallbackTimeMs);
+    }
+  };
+
+  const reloadPreviewSound = async () => {
+    const audio = previewAudioRef.current;
+    const wasPlaying = currentView === "preview" && isPlaying;
+    const baseTimeMs = audio && previewAudioSrc && Number.isFinite(audio.currentTime)
+      ? Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, audio.currentTime * 1000))
+      : previewCursorTimeMs;
+
+    clearAllPreviewLaneFlash();
+
+    try {
+      const hitsoundContext = await resumePreviewHitsoundContext();
+      if (hitsoundContext?.state === "running") {
+        await ensurePreviewHitsoundBuffer();
+      }
+
+      if (audio && previewAudioSrc) {
+        audio.pause();
+        try {
+          audio.load();
+        } catch {
+          // noop
+        }
+
+        if (audio.readyState < 1) {
+          await waitForPreviewAudioEvent(audio, "loadedmetadata").catch(() => undefined);
+        }
+
+        writePreviewAudioTime(baseTimeMs);
+
+        if (wasPlaying) {
+          if (audio.readyState < 3) {
+            await waitForPreviewAudioEvent(audio, "canplay").catch(() => undefined);
+          }
+          const playResult = audio.play();
+          if (playResult !== undefined) {
+            await playResult.catch(() => undefined);
+          }
+          const actualTimeMs = Math.max(previewMinTimeMs, Math.min(previewMaxTimeMs, audio.currentTime * 1000));
+          previewPlaybackUsesAudioClockRef.current = true;
+          previewPlaybackBaseRef.current = actualTimeMs;
+          previewPlaybackStartedAtRef.current = null;
+          setPreviewAnchorTimeMs(actualTimeMs);
+          setPreviewCursorTimeMs(actualTimeMs);
+          setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, actualTimeMs));
+          syncPreviewHitsoundPointer(actualTimeMs);
+        } else {
+          previewPlaybackUsesAudioClockRef.current = false;
+          previewPlaybackBaseRef.current = baseTimeMs;
+          previewPlaybackStartedAtRef.current = null;
+          setPreviewAnchorTimeMs(baseTimeMs);
+          setPreviewCursorTimeMs(baseTimeMs);
+          setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, baseTimeMs));
+          syncPreviewHitsoundPointer(baseTimeMs);
+        }
+
+        setPreviewAudioStatus("ready");
+        setPreviewAudioError("");
+        setToast("오디오/히트사운드를 다시 불러왔습니다.");
+        return;
+      }
+
+      previewPlaybackUsesAudioClockRef.current = false;
+      previewPlaybackBaseRef.current = baseTimeMs;
+      previewPlaybackStartedAtRef.current = wasPlaying ? performance.now() : null;
+      setPreviewAnchorTimeMs(baseTimeMs);
+      setPreviewCursorTimeMs(baseTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, baseTimeMs));
+      syncPreviewHitsoundPointer(baseTimeMs);
+      setToast("히트사운드를 다시 불러왔습니다.");
+    } catch {
+      previewPlaybackUsesAudioClockRef.current = false;
+      previewPlaybackBaseRef.current = baseTimeMs;
+      previewPlaybackStartedAtRef.current = wasPlaying ? performance.now() : null;
+      setPreviewAnchorTimeMs(baseTimeMs);
+      setPreviewCursorTimeMs(baseTimeMs);
+      setPreviewCursorScrollBeat(getPreviewScrollBeatByTime(previewTimingData.divisionSpans, baseTimeMs));
+      syncPreviewHitsoundPointer(baseTimeMs);
+      setToast("사운드 리로드에 실패했습니다.");
+    }
+  };
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void recoverPreviewSoundState();
+      }
+    };
+
+    const handlePageShow = () => {
+      void recoverPreviewSoundState();
+    };
+
+    const handleFocus = () => {
+      if (document.visibilityState !== "hidden") {
+        void recoverPreviewSoundState();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pageshow", handlePageShow);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [isPlaying, previewAudioSrc, previewCursorTimeMs, previewMaxTimeMs, previewMinTimeMs, previewTimingData.divisionSpans]);
+
   const applyPreviewZoom = (rawValue: number) => {
     const nextZoom = normalizePreviewZoom(rawValue);
     setPreviewZoom(nextZoom);
@@ -3232,6 +3501,24 @@ export default function UCSMobileAlpha1() {
   const selectedCellRangeSize = selectedCellRange
     ? `${selectedCellRange.totalRowCount}×${selectedCellRange.colEnd - selectedCellRange.colStart + 1}`
     : null;
+  const divisionDeleteTargetIndexes = useMemo(() => {
+    if (selectedCellRange || rangeAnchor?.kind === "cell") return [] as number[];
+    const targets = getOrderedSelectedRows();
+    if (targets.length === 0) return [selectedDivisionIdx];
+    return Array.from(new Set(targets.map((row) => row.divIdx))).sort((a, b) => a - b);
+  }, [selectedCellRange, rangeAnchor, multiSelectedRows, selectedRow, divisions, selectedDivisionIdx]);
+  const divisionDeleteBlockedReason = selectedCellRange || rangeAnchor?.kind === "cell"
+    ? "셀 범위 선택 상태에서는 Division 삭제를 할 수 없습니다."
+    : divisions.length - divisionDeleteTargetIndexes.length < 1
+      ? "모든 Division은 삭제할 수 없습니다. 최소 1개는 남아야 합니다."
+      : null;
+  const openDeleteDivisionDialog = () => {
+    if (selectedCellRange || rangeAnchor?.kind === "cell") {
+      setToast("셀 범위 선택 상태에서는 Division 삭제를 할 수 없습니다.");
+      return;
+    }
+    setDeleteOpen(true);
+  };
 
   const handleEditorZoomChange = (nextZoom: ZoomLevel) => {
     if (nextZoom === zoomLevel) return;
@@ -3708,9 +3995,11 @@ export default function UCSMobileAlpha1() {
 
   const copySelection = () => {
     if (selectedCellRange) {
-      const payload = toClipboardRowsFromSelectedCells(divisions, selectedCellRange);
-      setClipboardData(payload);
-      setToast(`${payload.rowCount}행 × ${payload.effectiveColCount}열 셀 범위를 클립보드에 복사했습니다.`);
+      const flatPayload = toClipboardRowsFromSelectedCells(divisions, selectedCellRange);
+      const insertPayload = buildInsertClipboardFromSelectedCells(divisions, selectedCellRange);
+      setFlatClipboardData(flatPayload);
+      setInsertClipboardData(insertPayload);
+      setToast(`${flatPayload.rowCount}행 × ${flatPayload.effectiveColCount}열 셀 범위를 클립보드에 복사했습니다.`);
       return;
     }
 
@@ -3719,9 +4008,11 @@ export default function UCSMobileAlpha1() {
       setToast("복사할 행 또는 셀 범위를 먼저 선택하세요.");
       return;
     }
-    const payload = toClipboardRowsFromSelectedRows(divisions, targets);
-    setClipboardData(payload);
-    setToast(`${payload.rowCount}개 행을 클립보드에 복사했습니다.`);
+    const flatPayload = toClipboardRowsFromSelectedRows(divisions, targets);
+    const insertPayload = buildInsertClipboardFromSelectedRows(divisions, targets);
+    setFlatClipboardData(flatPayload);
+    setInsertClipboardData(insertPayload);
+    setToast(`${flatPayload.rowCount}개 행을 클립보드에 복사했습니다.`);
   };
 
   const mirrorSelectionHorizontally = () => {
@@ -3796,7 +4087,7 @@ export default function UCSMobileAlpha1() {
   };
 
   const pasteClipboard = () => {
-    if (!clipboardData || clipboardData.rows.length === 0) {
+    if (!flatClipboardData || flatClipboardData.rows.length === 0) {
       setToast("붙여넣을 복사 데이터가 없습니다.");
       return;
     }
@@ -3806,23 +4097,23 @@ export default function UCSMobileAlpha1() {
       const next = cloneDivisions(divisions);
       const targetHeight = selectedCellRange.totalRowCount;
       const targetWidth = selectedCellRange.colEnd - selectedCellRange.colStart + 1;
-      const appliedRows = Math.min(targetHeight, clipboardData.rowCount);
-      const appliedCols = Math.min(targetWidth, clipboardData.effectiveColCount);
+      const appliedRows = Math.min(targetHeight, flatClipboardData.rowCount);
+      const appliedCols = Math.min(targetWidth, flatClipboardData.effectiveColCount);
       const targetRows = getSelectedCellRangeRows(selectedCellRange);
 
       for (let rowOffset = 0; rowOffset < appliedRows; rowOffset += 1) {
         const targetRow = targetRows[rowOffset];
         for (let colOffset = 0; colOffset < appliedCols; colOffset += 1) {
-          const value = clipboardData.rows[rowOffset][colOffset];
+          const value = flatClipboardData.rows[rowOffset][colOffset];
           if (value === "*") continue;
           next[targetRow.divIdx].rows[targetRow.rowIdx][selectedCellRange.colStart + colOffset] = value;
         }
       }
 
       setDivisions(next);
-      if (targetHeight > clipboardData.rowCount || targetWidth > clipboardData.effectiveColCount) {
+      if (targetHeight > flatClipboardData.rowCount || targetWidth > flatClipboardData.effectiveColCount) {
         setToast(`선택 범위가 더 커서 클립보드 크기인 ${appliedRows}행 × ${appliedCols}열만 붙여넣었습니다.`);
-      } else if (appliedRows < clipboardData.rowCount || appliedCols < clipboardData.effectiveColCount) {
+      } else if (appliedRows < flatClipboardData.rowCount || appliedCols < flatClipboardData.effectiveColCount) {
         setToast(`선택 범위 안에 겹치는 ${appliedRows}행 × ${appliedCols}열만 붙여넣었습니다.`);
       } else {
         setToast(`${appliedRows}행 × ${appliedCols}열 셀 범위를 붙여넣었습니다.`);
@@ -3837,48 +4128,53 @@ export default function UCSMobileAlpha1() {
     }
     pushUndoSnapshot();
     const next = cloneDivisions(divisions);
-    const pasteCount = Math.min(clipboardData.rowCount, targets.length);
+    const pasteCount = Math.min(flatClipboardData.rowCount, targets.length);
     for (let i = 0; i < pasteCount; i += 1) {
       const target = targets[i];
-      for (let colIdx = 0; colIdx < clipboardData.effectiveColCount; colIdx += 1) {
-        const value = clipboardData.rows[i][colIdx];
+      for (let colIdx = 0; colIdx < flatClipboardData.effectiveColCount; colIdx += 1) {
+        const value = flatClipboardData.rows[i][colIdx];
         if (value === "*") continue;
         next[target.divIdx].rows[target.rowIdx][colIdx] = value;
       }
     }
     setDivisions(next);
-    if (targets.length > clipboardData.rowCount) {
-      setToast(`선택한 ${targets.length}행 중 클립보드 크기인 ${clipboardData.rowCount}행만 붙여넣었습니다.`);
-    } else if (clipboardData.rowCount > targets.length) {
-      setToast(`복사한 ${clipboardData.rowCount}행 중 ${targets.length}행만 붙여넣었습니다.`);
+    if (targets.length > flatClipboardData.rowCount) {
+      setToast(`선택한 ${targets.length}행 중 클립보드 크기인 ${flatClipboardData.rowCount}행만 붙여넣었습니다.`);
+    } else if (flatClipboardData.rowCount > targets.length) {
+      setToast(`복사한 ${flatClipboardData.rowCount}행 중 ${targets.length}행만 붙여넣었습니다.`);
     } else {
       setToast(`${pasteCount}개 행에 노트를 붙여넣었습니다.`);
     }
   };
 
   const insertCopiedBlocks = () => {
-    if (!clipboardData || clipboardData.rows.length === 0) {
-      setToast("붙여넣을 복사 데이터가 없습니다.");
+    if (!insertClipboardData || insertClipboardData.divisions.length === 0) {
+      setToast("삽입할 속성 포함 복사 데이터가 없습니다.");
       return;
     }
     pushUndoSnapshot();
-    const sourceDivision = divisions[selectedDivisionIdx];
-    const newDivision: Division = {
-      id: `${sourceDivision.id}-paste-${Date.now()}`,
-      bpm: sourceDivision.bpm,
-      delay: sourceDivision.delay,
-      beat: sourceDivision.beat,
-      split: sourceDivision.split,
-      rows: clipboardData.rows.map((row) => row.map((cell) => (cell === "*" ? "." : cell)) as Cell[]),
-    };
     const next = cloneDivisions(divisions);
-    next.splice(selectedDivisionIdx, 0, newDivision);
+    const insertedDivisions: Division[] = insertClipboardData.divisions.map((division, index) => ({
+      id: `insert-clipboard-${Date.now()}-${index}`,
+      bpm: division.bpm,
+      delay: division.delay,
+      beat: division.beat,
+      split: division.split,
+      rows: division.rows.map((row) => [...row] as Cell[]),
+    }));
+    next.splice(selectedDivisionIdx, 0, ...insertedDivisions);
     setDivisions(next);
-    setSelectedRow({ divIdx: selectedDivisionIdx, rowIdx: 0 });
     setSelectedDivisionIdx(selectedDivisionIdx);
+    setSelectedRow({ divIdx: selectedDivisionIdx, rowIdx: 0 });
     setMultiSelectedRows([]);
+    setSelectedCellRange(null);
+    setRangeAnchor(null);
     setPendingLongStart(null);
-    setToast(`복사한 Division을 Div ${selectedDivisionIdx + 1}의 바로 위에 삽입했습니다.`);
+    setToast(
+      insertedDivisions.length === 1
+        ? `복사한 Division을 Div ${selectedDivisionIdx + 1}의 바로 위에 삽입했습니다.`
+        : `복사한 ${insertedDivisions.length}개 Division을 Div ${selectedDivisionIdx + 1}의 바로 위에 삽입했습니다.`,
+    );
   };
 
   const applyResize = () => {
@@ -3959,23 +4255,39 @@ export default function UCSMobileAlpha1() {
   };
 
   const deleteDivision = () => {
-    if (divisions.length <= 1) {
-      setToast("마지막 Division은 삭제할 수 없습니다.");
+    if (selectedCellRange || rangeAnchor?.kind === "cell") {
+      setDeleteOpen(false);
+      setToast("셀 범위 선택 상태에서는 Division 삭제를 할 수 없습니다.");
+      return;
+    }
+
+    const targetIndexes = divisionDeleteTargetIndexes.length > 0 ? divisionDeleteTargetIndexes : [selectedDivisionIdx];
+    if (divisions.length - targetIndexes.length < 1) {
+      setToast("모든 Division은 삭제할 수 없습니다. 최소 1개는 남아야 합니다.");
       setDeleteOpen(false);
       return;
     }
-    const deletedIndex = selectedDivisionIdx;
+
     pushUndoSnapshot();
-    const next = cloneDivisions(divisions);
-    next.splice(deletedIndex, 1);
-    const nextSelectedDivisionIdx = Math.max(0, Math.min(deletedIndex, next.length - 1));
+    const deleteSet = new Set(targetIndexes);
+    const next = cloneDivisions(divisions).filter((_, index) => !deleteSet.has(index));
+    const firstDeletedIndex = Math.min(...targetIndexes);
+    const nextSelectedDivisionIdx = Math.max(0, Math.min(firstDeletedIndex, next.length - 1));
     setDivisions(next);
     setSelectedDivisionIdx(nextSelectedDivisionIdx);
     setSelectedRow(null);
     setMultiSelectedRows([]);
+    setSelectedCellRange(null);
+    setRangeAnchor(null);
     setPendingLongStart(null);
+    setIsTemporaryLongStart(false);
+    setManualExpandedGroups([]);
     setDeleteOpen(false);
-    setToast(`Div ${deletedIndex + 1}을 삭제했습니다.`);
+    setToast(
+      targetIndexes.length === 1
+        ? `Div ${targetIndexes[0] + 1}을 삭제했습니다.`
+        : `선택 범위에 포함된 ${targetIndexes.length}개 Division을 삭제했습니다.`,
+    );
   };
 
   return (
@@ -4294,7 +4606,7 @@ export default function UCSMobileAlpha1() {
                         </div>
                         <div className="rounded-2xl bg-white/5 p-3">
                           <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-400">Preview Audio</div>
-                          <div className="mt-2 flex items-center gap-2">
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
                             <input ref={previewAudioFileInputRef} type="file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/mpeg,audio/mp4,audio/wav,audio/x-wav,audio/ogg,audio/webm" className="hidden" onChange={handlePreviewAudioFileChange} />
                             <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => previewAudioFileInputRef.current?.click()}>
                               {previewAudioReconnectNeeded ? "다시 연결" : previewAudioSrc ? "교체" : "Upload"}
@@ -4308,6 +4620,9 @@ export default function UCSMobileAlpha1() {
                                 Clear
                               </Button>
                             )}
+                            <Button type="button" variant="outline" size="sm" className="h-8 rounded-xl border-white/20 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => void reloadPreviewSound()}>
+                              Reload
+                            </Button>
                           </div>
                           <div className="mt-2 rounded-xl bg-slate-900/40 px-3 py-2 text-[11px] text-slate-400">원격 URL 입력은 배포 보안 설정에 따라 숨겨져 있습니다.</div>
                           {previewAudioReconnectNeeded && (
@@ -4432,9 +4747,9 @@ export default function UCSMobileAlpha1() {
           )}
         </main>
         {appSection === "workspace" && currentView === "editor" && toolSheetOpen && (
-        <div className="fixed inset-x-0 bottom-[118px] z-40">
+        <div className="fixed inset-x-0 z-40" style={{ bottom: `${bottomBarHeight + 12}px` }}>
           <div className="mx-auto w-full max-w-md px-3">
-            <div className="overflow-x-auto pb-1">
+            <div className="max-h-[44vh] overflow-x-auto overflow-y-auto pb-1">
               <div className="flex min-w-max gap-3">
                 <div className="w-[260px] shrink-0 rounded-[28px] border bg-white p-4 shadow-xl">
                   <div className="mb-3 flex items-center justify-between gap-2">
@@ -4499,7 +4814,7 @@ export default function UCSMobileAlpha1() {
                     <Button variant="outline" className="rounded-2xl" onClick={() => { mergeDivisionWithBelow(); closeToolSheet(); }}>
                       <Rows3 className="mr-2 h-4 w-4" />Merge
                     </Button>
-                    <Button variant="outline" className="col-span-2 rounded-2xl text-red-600" onClick={() => { setDeleteOpen(true); closeToolSheet(); }}>
+                    <Button variant="outline" className="col-span-2 rounded-2xl text-red-600" onClick={() => { openDeleteDivisionDialog(); closeToolSheet(); }} disabled={Boolean(selectedCellRange)}>
                       <Trash2 className="mr-2 h-4 w-4" />Division 삭제
                     </Button>
                   </div>
@@ -4511,7 +4826,7 @@ export default function UCSMobileAlpha1() {
       )}
 
       {appSection === "workspace" && (
-        <div className="z-40 shrink-0 border-t bg-white/95 backdrop-blur">
+        <div ref={bottomBarRef} className="z-40 shrink-0 border-t bg-white/95 backdrop-blur">
           <div className="mx-auto w-full max-w-md px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2">
             {currentView === "editor" ? (
               <>
@@ -4777,11 +5092,17 @@ export default function UCSMobileAlpha1() {
           <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 p-4">
             <div className="w-full max-w-sm rounded-[28px] bg-white p-4 shadow-2xl">
               <div className="mb-3 text-lg font-semibold">Division 삭제</div>
-              <div className="rounded-2xl bg-slate-50 p-3 text-sm text-slate-700">Div {selectedDivisionIdx + 1}을 삭제합니다. 이 Division의 모든 행과 속성이 제거됩니다.</div>
-              <div className="mt-3 rounded-2xl bg-slate-50 p-3 text-xs text-slate-500">{divisions.length <= 1 ? "마지막 Division은 삭제할 수 없습니다." : "삭제 후에는 되돌리기 기능이 필요할 수 있습니다. 현재 Alpha 1에서는 즉시 반영됩니다."}</div>
+              <div className="rounded-2xl bg-slate-50 p-3 text-sm text-slate-700">
+                {divisionDeleteTargetIndexes.length > 1
+                  ? `선택 범위에 포함된 ${divisionDeleteTargetIndexes.length}개 Division을 삭제합니다. (${divisionDeleteTargetIndexes[0] + 1} ~ ${divisionDeleteTargetIndexes[divisionDeleteTargetIndexes.length - 1] + 1})`
+                  : `Div ${selectedDivisionIdx + 1}을 삭제합니다. 이 Division의 모든 행과 속성이 제거됩니다.`}
+              </div>
+              <div className="mt-3 rounded-2xl bg-slate-50 p-3 text-xs text-slate-500">
+                {divisionDeleteBlockedReason ?? "삭제 후에는 되돌리기 기능이 필요할 수 있습니다. 현재 Alpha 1에서는 즉시 반영됩니다."}
+              </div>
               <div className="mt-4 flex gap-2">
                 <Button variant="outline" className="flex-1" onClick={() => setDeleteOpen(false)}>취소</Button>
-                <Button className="flex-1 bg-red-600 hover:bg-red-700" onClick={deleteDivision}>삭제</Button>
+                <Button className="flex-1 bg-red-600 hover:bg-red-700" onClick={deleteDivision} disabled={Boolean(divisionDeleteBlockedReason)}>삭제</Button>
               </div>
             </div>
           </div>
