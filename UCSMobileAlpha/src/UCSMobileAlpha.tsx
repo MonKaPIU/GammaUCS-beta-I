@@ -281,6 +281,16 @@ type RecentProjectSnapshot = {
   audio: PersistedAudioMeta;
 };
 
+function createEmptyPersistedAudioMeta(): PersistedAudioMeta {
+  return {
+    mode: "none",
+    fileName: null,
+    mimeType: null,
+    size: null,
+    durationMs: null,
+  };
+}
+
 const CELL_LABELS = ["↙", "↖", "□", "↗", "↘"] as const;
 const ZOOM_LEVELS: ZoomLevel[] = [1, 2, 4, 8];
 const ROW_LABEL_WIDTH = "w-20";
@@ -1696,13 +1706,7 @@ export default function UCSMobileAlpha1() {
   const [previewAudioStatus, setPreviewAudioStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [previewAudioError, setPreviewAudioError] = useState("");
   const [previewAudioDurationMs, setPreviewAudioDurationMs] = useState<number | null>(null);
-  const [recentAudioMeta, setRecentAudioMeta] = useState<PersistedAudioMeta>({
-    mode: "none",
-    fileName: null,
-    mimeType: null,
-    size: null,
-    durationMs: null,
-  });
+  const [recentAudioMeta, setRecentAudioMeta] = useState<PersistedAudioMeta>(createEmptyPersistedAudioMeta());
   const [previewAudioReconnectNeeded, setPreviewAudioReconnectNeeded] = useState(false);
   const [recentProjectAutosaveReady, setRecentProjectAutosaveReady] = useState(false);
   const [editorAnchorTimeMs, setEditorAnchorTimeMs] = useState(0);
@@ -1933,26 +1937,43 @@ export default function UCSMobileAlpha1() {
     }
   };
 
+  const buildPersistedUiState = (): PersistedUiState => ({
+    appSection,
+    currentView,
+    selectedDivisionIdx,
+    selectedRow: selectedRow ? { ...selectedRow } : null,
+    previewAnchorTimeMs,
+    previewZoom,
+    previewHitsoundVolume,
+    previewInfoPanelOpen,
+  });
+
+  const buildPersistedAudioMeta = (): PersistedAudioMeta => ({
+    ...recentAudioMeta,
+    durationMs: recentAudioMeta.mode === "file" ? previewAudioDurationMs ?? recentAudioMeta.durationMs : recentAudioMeta.durationMs,
+  });
+
+  const applyRestoredAudioMetaState = (restoredAudioMeta: PersistedAudioMeta) => {
+    const hasReconnectableAudio = restoredAudioMeta.mode === "file" && Boolean(restoredAudioMeta.fileName);
+    setPreviewAudioSrc("");
+    setPreviewAudioMode("none");
+    setPreviewAudioReconnectNeeded(hasReconnectableAudio);
+    setPreviewAudioLabel(hasReconnectableAudio ? `이전 오디오: ${restoredAudioMeta.fileName}` : "오디오 없음");
+    setPreviewAudioStatus("idle");
+    setPreviewAudioError("");
+    setPreviewAudioDurationMs(null);
+    setRecentAudioMeta(restoredAudioMeta);
+    return hasReconnectableAudio;
+  };
+
   const buildRecentProjectSnapshot = (): RecentProjectSnapshot => ({
     version: RECENT_PROJECT_SCHEMA_VERSION,
     projectId: RECENT_PROJECT_ID,
     updatedAt: Date.now(),
     exportFileNameInput,
     divisions: cloneDivisions(divisions),
-    ui: {
-      appSection,
-      currentView,
-      selectedDivisionIdx,
-      selectedRow: selectedRow ? { ...selectedRow } : null,
-      previewAnchorTimeMs,
-      previewZoom,
-      previewHitsoundVolume,
-      previewInfoPanelOpen,
-    },
-    audio: {
-      ...recentAudioMeta,
-      durationMs: recentAudioMeta.mode === "file" ? previewAudioDurationMs ?? recentAudioMeta.durationMs : recentAudioMeta.durationMs,
-    },
+    ui: buildPersistedUiState(),
+    audio: buildPersistedAudioMeta(),
   });
 
   const persistRecentProjectNow = async (snapshot: RecentProjectSnapshot, notifyOnError = false) => {
@@ -1966,30 +1987,35 @@ export default function UCSMobileAlpha1() {
     }
   };
 
-  const applyRecentProjectSnapshot = (snapshot: RecentProjectSnapshot) => {
-    const nextDivisions = snapshot.divisions.length > 0 ? cloneDivisions(snapshot.divisions) : cloneDivisions(initialDivisions);
-    const nextTimingData = buildPreviewTimingData(nextDivisions);
-    const nextSelectedDivisionIdx = Math.max(0, Math.min(snapshot.ui.selectedDivisionIdx, nextDivisions.length - 1));
-    const rawSelectedRow = snapshot.ui.selectedRow;
-    const nextSelectedRow = rawSelectedRow && nextDivisions[rawSelectedRow.divIdx]?.rows[rawSelectedRow.rowIdx]
-      ? { divIdx: rawSelectedRow.divIdx, rowIdx: rawSelectedRow.rowIdx }
-      : null;
-    const restoredAnchorTimeMs = Math.max(
-      nextTimingData.chartStartTimeMs,
-      Math.min(nextTimingData.chartEndTimeMs, snapshot.ui.previewAnchorTimeMs),
-    );
-    const restoredScrollBeat = getPreviewScrollBeatByTime(nextTimingData.divisionSpans, restoredAnchorTimeMs);
-    const restoredZoom = normalizePreviewZoom(snapshot.ui.previewZoom);
-    const restoredVolume = normalizeHitsoundVolume(snapshot.ui.previewHitsoundVolume);
-    const restoredAudioMeta = snapshot.audio ?? {
-      mode: "none",
-      fileName: null,
-      mimeType: null,
-      size: null,
-      durationMs: null,
-    };
-    const hasReconnectableAudio = restoredAudioMeta.mode === "file" && Boolean(restoredAudioMeta.fileName);
+  const queueRecentProjectAutosave = (snapshot?: RecentProjectSnapshot) => {
+    if (!recentProjectAutosaveReady) return;
+    const nextSnapshot = snapshot ?? buildRecentProjectSnapshot();
+    latestRecentProjectSnapshotRef.current = nextSnapshot;
+    clearRecentProjectSaveTimeout();
+    recentProjectSaveTimeoutRef.current = window.setTimeout(() => {
+      void persistRecentProjectNow(nextSnapshot, true);
+      recentProjectSaveTimeoutRef.current = null;
+    }, RECENT_PROJECT_AUTOSAVE_DELAY_MS);
+  };
 
+  const flushRecentProjectAutosave = (snapshot?: RecentProjectSnapshot, notifyOnError = false) => {
+    if (!recentProjectAutosaveReady) return;
+    const nextSnapshot = snapshot ?? latestRecentProjectSnapshotRef.current ?? buildRecentProjectSnapshot();
+    latestRecentProjectSnapshotRef.current = nextSnapshot;
+    clearRecentProjectSaveTimeout();
+    void persistRecentProjectNow(nextSnapshot, notifyOnError);
+  };
+
+  const applyRestoredWorkspaceState = (
+    snapshot: RecentProjectSnapshot,
+    nextDivisions: Division[],
+    nextSelectedDivisionIdx: number,
+    nextSelectedRow: RowSelection | null,
+    restoredAnchorTimeMs: number,
+    restoredScrollBeat: number,
+    restoredZoom: number,
+    restoredVolume: number,
+  ) => {
     setDivisions(nextDivisions);
     setExportFileNameInput(sanitizeUcsFileNameInput(stripUcsExtension(snapshot.exportFileNameInput)) || "untitled");
     setSelectedDivisionIdx(nextSelectedDivisionIdx);
@@ -2012,7 +2038,14 @@ export default function UCSMobileAlpha1() {
     setPreviewHitsoundVolume(restoredVolume);
     setPreviewInfoPanelOpen(snapshot.ui.previewInfoPanelOpen);
     setEditorAnchorTimeMs(restoredAnchorTimeMs);
-    setPendingEditorSyncTarget(nextSelectedRow && snapshot.ui.currentView === "editor" ? { ...nextSelectedRow, timeMs: restoredAnchorTimeMs } : null);
+  };
+
+  const applyRestoredPlaybackState = (
+    restoredAnchorTimeMs: number,
+    nextSelectedRow: RowSelection | null,
+    restoredView: ViewMode,
+  ) => {
+    setPendingEditorSyncTarget(nextSelectedRow && restoredView === "editor" ? { ...nextSelectedRow, timeMs: restoredAnchorTimeMs } : null);
     previewPlaybackRequestIdRef.current += 1;
     previewPlaybackUsesAudioClockRef.current = false;
     previewPlaybackBaseRef.current = restoredAnchorTimeMs;
@@ -2020,14 +2053,37 @@ export default function UCSMobileAlpha1() {
     previewLastHitsoundRowIndexRef.current = -1;
     setIsPlaying(false);
     previewAudioRef.current?.pause();
-    setPreviewAudioSrc("");
-    setPreviewAudioMode("none");
-    setPreviewAudioReconnectNeeded(hasReconnectableAudio);
-    setPreviewAudioLabel(hasReconnectableAudio ? `이전 오디오: ${restoredAudioMeta.fileName}` : "오디오 없음");
-    setPreviewAudioStatus("idle");
-    setPreviewAudioError("");
-    setPreviewAudioDurationMs(null);
-    setRecentAudioMeta(restoredAudioMeta);
+  };
+
+  const applyRecentProjectSnapshot = (snapshot: RecentProjectSnapshot) => {
+    const nextDivisions = snapshot.divisions.length > 0 ? cloneDivisions(snapshot.divisions) : cloneDivisions(initialDivisions);
+    const nextTimingData = buildPreviewTimingData(nextDivisions);
+    const nextSelectedDivisionIdx = Math.max(0, Math.min(snapshot.ui.selectedDivisionIdx, nextDivisions.length - 1));
+    const rawSelectedRow = snapshot.ui.selectedRow;
+    const nextSelectedRow = rawSelectedRow && nextDivisions[rawSelectedRow.divIdx]?.rows[rawSelectedRow.rowIdx]
+      ? { divIdx: rawSelectedRow.divIdx, rowIdx: rawSelectedRow.rowIdx }
+      : null;
+    const restoredAnchorTimeMs = Math.max(
+      nextTimingData.chartStartTimeMs,
+      Math.min(nextTimingData.chartEndTimeMs, snapshot.ui.previewAnchorTimeMs),
+    );
+    const restoredScrollBeat = getPreviewScrollBeatByTime(nextTimingData.divisionSpans, restoredAnchorTimeMs);
+    const restoredZoom = normalizePreviewZoom(snapshot.ui.previewZoom);
+    const restoredVolume = normalizeHitsoundVolume(snapshot.ui.previewHitsoundVolume);
+    const restoredAudioMeta = snapshot.audio ?? createEmptyPersistedAudioMeta();
+
+    applyRestoredWorkspaceState(
+      snapshot,
+      nextDivisions,
+      nextSelectedDivisionIdx,
+      nextSelectedRow,
+      restoredAnchorTimeMs,
+      restoredScrollBeat,
+      restoredZoom,
+      restoredVolume,
+    );
+    applyRestoredPlaybackState(restoredAnchorTimeMs, nextSelectedRow, snapshot.ui.currentView);
+    const hasReconnectableAudio = applyRestoredAudioMetaState(restoredAudioMeta);
     setToast(hasReconnectableAudio ? "최근 작업과 오디오 메타를 복원했습니다. 오디오는 다시 연결해야 합니다." : "최근 작업을 복원했습니다.");
   };
 
@@ -2066,12 +2122,7 @@ export default function UCSMobileAlpha1() {
     if (!recentProjectAutosaveReady) return;
 
     const snapshot = buildRecentProjectSnapshot();
-    latestRecentProjectSnapshotRef.current = snapshot;
-    clearRecentProjectSaveTimeout();
-    recentProjectSaveTimeoutRef.current = window.setTimeout(() => {
-      void persistRecentProjectNow(snapshot, true);
-      recentProjectSaveTimeoutRef.current = null;
-    }, RECENT_PROJECT_AUTOSAVE_DELAY_MS);
+    queueRecentProjectAutosave(snapshot);
 
     return clearRecentProjectSaveTimeout;
   }, [
@@ -2091,27 +2142,23 @@ export default function UCSMobileAlpha1() {
   ]);
 
   useEffect(() => {
-    const flushRecentProject = () => {
-      if (!recentProjectAutosaveReady) return;
-      const snapshot = latestRecentProjectSnapshotRef.current ?? buildRecentProjectSnapshot();
-      latestRecentProjectSnapshotRef.current = snapshot;
-      clearRecentProjectSaveTimeout();
-      void persistRecentProjectNow(snapshot, false);
+    const handlePageHide = () => {
+      flushRecentProjectAutosave();
     };
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
-        flushRecentProject();
+        flushRecentProjectAutosave();
       }
     };
 
-    window.addEventListener("pagehide", flushRecentProject);
+    window.addEventListener("pagehide", handlePageHide);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
-      window.removeEventListener("pagehide", flushRecentProject);
+      window.removeEventListener("pagehide", handlePageHide);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [recentProjectAutosaveReady]);
+  }, [recentProjectAutosaveReady, divisions, exportFileNameInput, appSection, currentView, selectedDivisionIdx, selectedRow, previewAnchorTimeMs, previewZoom, previewHitsoundVolume, previewInfoPanelOpen, recentAudioMeta, previewAudioDurationMs]);
 
   const importUcsFromText = () => {
     const source = importTextDraft.trim();
@@ -2594,8 +2641,9 @@ export default function UCSMobileAlpha1() {
         setPreviewAudioStatus("error");
         setPreviewAudioError(`오디오 길이는 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지만 허용됩니다. 현재 ${formatDurationLabel(durationMs)}입니다.`);
         setPreviewAudioDurationMs(null);
-        setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
-        if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
+        setRecentAudioMeta(createEmptyPersistedAudioMeta());
+        const previewAudioInput = previewAudioFileInputRef.current;
+        if (previewAudioInput) previewAudioInput.value = "";
         setToast(`오디오 길이 제한을 초과했습니다. 최대 ${formatDurationLabel(MAX_PREVIEW_AUDIO_DURATION_MS)}까지 업로드할 수 있습니다.`);
         return;
       }
@@ -2692,8 +2740,9 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioStatus("idle");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
-    setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
-    if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
+    setRecentAudioMeta(createEmptyPersistedAudioMeta());
+    const previewAudioInput = previewAudioFileInputRef.current;
+    if (previewAudioInput) previewAudioInput.value = "";
     setToast("프리뷰 오디오를 제거했습니다.");
   };
 
@@ -2706,8 +2755,9 @@ export default function UCSMobileAlpha1() {
     setPreviewAudioStatus("idle");
     setPreviewAudioError("");
     setPreviewAudioDurationMs(null);
-    setRecentAudioMeta({ mode: "none", fileName: null, mimeType: null, size: null, durationMs: null });
-    if (previewAudioFileInputRef.current) previewAudioFileInputRef.current.value = "";
+    setRecentAudioMeta(createEmptyPersistedAudioMeta());
+    const previewAudioInput = previewAudioFileInputRef.current;
+    if (previewAudioInput) previewAudioInput.value = "";
     setToast("이전 오디오 다시 연결 안내를 해제했습니다.");
   };
 
